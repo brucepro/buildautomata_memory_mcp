@@ -59,7 +59,7 @@ class MemoryCLI:
             "success": success,
             "memory_id": memory.id,
             "warnings": warnings,
-            "content": content[:100] + "..." if len(content) > 100 else content
+            "content": content
         }
 
         return result
@@ -136,7 +136,7 @@ class MemoryCLI:
                     "change_description": change["change_description"],
                     "category": change["category"],
                     "importance": change["importance"],
-                    "content_preview": change["content"][:100] + "..." if len(change["content"]) > 100 else change["content"],
+                    "content_preview": change["content"],
                     "tags": change["tags"],
                     "what_changed": change.get("what_changed", [])
                 })
@@ -363,8 +363,8 @@ Examples:
                     version_count = mem.get('version_count', 1)
                     access_count = mem.get('access_count', 0)
 
-                    print(f"{i}. [{mem_id[:8]}...] {category} (importance: {importance:.2f}, current: {current_imp:.2f})")
-                    print(f"   {content[:200]}{'...' if len(content) > 200 else ''}")
+                    print(f"{i}. [{mem_id}...] {category} (importance: {importance:.2f}, current: {current_imp:.2f})")
+                    print(f"   {content[]}")
                     print(f"   Tags: {', '.join(tags) if tags else 'none'}")
                     print(f"   Created: {created_at}, Versions: {version_count}, Accessed: {access_count}x")
 
@@ -419,7 +419,7 @@ Examples:
                 print(f"Deleted count: {result.get('deleted_count', 0)}")
                 print(f"Retained count: {result.get('retained_count', 0)}")
                 if result.get('deleted_ids'):
-                    print(f"Deleted IDs: {', '.join(result['deleted_ids'][:10])}{'...' if len(result['deleted_ids']) > 10 else ''}")
+                    print(f"Deleted IDs: {', '.join(result['deleted_ids'])}")
 
             elif args.command == "maintenance":
                 print("Maintenance Results:")

@@ -36,13 +36,11 @@ logger = logging.getLogger("buildautomata-memory")
 for logger_name in ["qdrant_client", "sentence_transformers", "urllib3", "httpx"]:
     logging.getLogger(logger_name).setLevel(logging.CRITICAL)
 
-# MCP imports
 from mcp.server.models import InitializationOptions
 from mcp.server import NotificationOptions, Server
 from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent
 
-# Optional dependencies
 try:
     from qdrant_client import QdrantClient
     from qdrant_client.models import (
@@ -157,17 +155,13 @@ class MemoryStore:
         self.encoder = None
         self.db_conn = None
 
-        # Thread safety
         self._db_lock = threading.RLock()
 
-        # LRU caches
         self.memory_cache: LRUCache = LRUCache(maxsize=self.config["cache_maxsize"])
         self.embedding_cache: LRUCache = LRUCache(maxsize=self.config["cache_maxsize"])
 
-        # Error tracking
         self.error_log: List[Dict[str, Any]] = []
         
-        # Maintenance tracking
         self.last_maintenance: Optional[datetime] = None
 
         self.initialize()
@@ -383,7 +377,6 @@ class MemoryStore:
 
         try:
             with self._db_lock:
-                # FIX: Explicit transaction to prevent race conditions
                 self.db_conn.execute("BEGIN IMMEDIATE")
                 
                 try:
@@ -432,7 +425,6 @@ class MemoryStore:
         """Store or update a memory with automatic versioning"""
         success_backends = []
         errors = []
-
         skip_version = False
         if is_update and old_hash:
             new_hash = memory.content_hash()
@@ -480,6 +472,7 @@ class MemoryStore:
             with self._db_lock:
                 version_id = None
                 if not skip_version:
+                    # Get previous version if updating
                     prev_version_id = None
                     if is_update:
                         cursor = self.db_conn.execute(
@@ -518,8 +511,8 @@ class MemoryStore:
                     memory.last_accessed,
                     memory.access_count,
                     memory.decay_rate,
-                    memory.id,  # For COALESCE subquery
-                    0 if skip_version else 1,  # Only increment if new version created
+                    memory.id,  
+                    0 if skip_version else 1,  
                     memory.content_hash()
                 ))
 
@@ -591,7 +584,6 @@ class MemoryStore:
             return False
 
     async def store_memories_batch(self, memories: List[Memory]) -> Tuple[int, List[str], List[str]]:
-        """FIX: Batch insert/update for efficiency"""
         success_count = 0
         success_backends = set()
         errors = []
@@ -680,6 +672,7 @@ class MemoryStore:
 
         existing.updated_at = datetime.now()
         
+        # Pass old hash to store_memory for comparison
         success, backends = await self.store_memory(existing, is_update=True, old_hash=old_hash)
 
         if success:
@@ -698,6 +691,7 @@ class MemoryStore:
             logger.debug(f"Memory {memory_id} found in cache")
             return self.memory_cache[memory_id]
 
+        # Try SQLite
         if self.db_conn:
             try:
                 memory = await asyncio.to_thread(self._get_from_sqlite, memory_id)
@@ -735,6 +729,7 @@ class MemoryStore:
         updated_after: Optional[str] = None,
         updated_before: Optional[str] = None,
     ) -> List[Dict]:
+        """Search memories with version history automatically included"""
         all_results = []
 
         # Vector search
@@ -779,11 +774,13 @@ class MemoryStore:
         for mem in unique[:limit]:
             await asyncio.to_thread(self._update_access, mem.id)
             
+            # Get fresh version count from database (in case Qdrant is out of sync)
             version_count = await asyncio.to_thread(self._get_version_count, mem.id)
             mem.version_count = version_count
             
             mem_dict = self._memory_to_dict(mem)
             
+            # Always include version history for memories with updates
             if include_versions and version_count > 1:
                 version_history = await asyncio.to_thread(self._get_version_history_summary, mem.id)
                 if version_history:
@@ -1039,7 +1036,6 @@ class MemoryStore:
 
     def _memory_to_dict(self, memory: Memory) -> Dict:
         """Convert Memory to dict for API response with statistics"""
-        # Calculate Saint Bernard approach metrics
         days_since_access = 0
         if memory.last_accessed:
             days_since_access = (datetime.now() - memory.last_accessed).days
@@ -1098,6 +1094,7 @@ class MemoryStore:
                         "reason": f"Current count ({current_count}) within limit ({max_memories})"
                     }
                 
+                # Calculate how many to prune
                 to_prune = current_count - max_memories
                 
                 # Find least valuable memories (low importance × low access × old)
@@ -1126,6 +1123,7 @@ class MemoryStore:
                         ]
                     }
                 
+                # Actually delete
                 pruned_ids = [row["id"] for row in candidates]
                 self.db_conn.execute(f"""
                     DELETE FROM memories WHERE id IN ({','.join('?' * len(pruned_ids))})
@@ -1137,6 +1135,7 @@ class MemoryStore:
                 
                 self.db_conn.commit()
                 
+                # Also remove from Qdrant
                 if self.qdrant_client:
                     try:
                         await asyncio.to_thread(
@@ -1163,6 +1162,7 @@ class MemoryStore:
             return {"error": str(e)}
 
     async def maintenance(self) -> Dict[str, Any]:
+        """FIX: Periodic maintenance tasks"""
         results = {
             "timestamp": datetime.now().isoformat(),
             "tasks": {}
@@ -1636,22 +1636,22 @@ async def handle_call_tool(name: str, arguments: dict) -> list[TextContent]:
                 for i, mem in enumerate(results, 1):
                     text += f"{i}. [{mem['category']}] (importance: {mem['importance']:.2f} → {mem['current_importance']:.2f})\n"
                     text += f"   ID: {mem['memory_id']}\n"
-                    text += f"   Current: {mem['content'][:150]}{'...' if len(mem['content']) > 150 else ''}\n"
+                    text += f"   Current: {mem['content']}\n"
                     text += f"   Tags: {', '.join(mem['tags'])}\n"
                     
-                    # Show Saint Bernard approach statistics
                     text += f"   📊 Stats: Accessed {mem['access_count']} times"
                     if mem['last_accessed']:
                         text += f" | Last access: {mem['days_since_access']} days ago | Decay: {mem['decay_factor']:.2%}\n"
                     else:
                         text += f" | Never accessed yet\n"
                     
+                    # Show full version history evolution if available
                     if 'version_history' in mem:
                         vh = mem['version_history']
                         text += f"\n   📜 EVOLUTION ({vh['update_count']} updates):\n"
                         for evo in vh['evolution']:
                             text += f"      v{evo['version']} ({evo['timestamp']}):\n"
-                            text += f"         Content: {evo['content'][:120]}{'...' if len(evo['content']) > 120 else ''}\n"
+                            text += f"         Content: {evo['content']}\n"
                             text += f"         Category: {evo['category']} | Importance: {evo['importance']}\n"
                     
                     text += f"\n   Updated: {mem['updated_at']}\n\n"
@@ -1708,7 +1708,7 @@ async def handle_call_tool(name: str, arguments: dict) -> list[TextContent]:
                     if change.get('what_changed'):
                         text += f"Changed: {', '.join(change['what_changed'])}\n"
                     
-                    text += f"Content: {change['content'][:200]}{'...' if len(change['content']) > 200 else ''}\n"
+                    text += f"Content: {change['content']}\n"
                     text += f"Tags: {', '.join(change['tags'])}\n"
                     text += f"Hash: {change['content_hash']}\n"
                     text += "\n" + "-" * 60 + "\n\n"
@@ -1755,6 +1755,7 @@ async def handle_call_tool(name: str, arguments: dict) -> list[TextContent]:
 
 
 async def main():
+    """Main entry point"""
     global memory_store
 
     try:
