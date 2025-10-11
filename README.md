@@ -27,7 +27,7 @@ BuildAutomata Memory is an MCP server that gives AI agents (like Claude) **persi
 1. **Clone this repository**
 ```bash
 git clone https://github.com/brucepro/buildautomata_memory_mcp.git
-cd buildautomata_memory_mcp_dev
+cd buildautomata_memory_mcp-main
 ```
 
 2. **Install dependencies**
