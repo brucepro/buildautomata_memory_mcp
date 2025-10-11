@@ -26,7 +26,7 @@ BuildAutomata Memory is an MCP server that gives AI agents (like Claude) **persi
 
 1. **Clone this repository**
 ```bash
-git clone https://github.com/brucepro/buildautomata_memory_mcp_dev.git
+git clone https://github.com/brucepro/buildautomata_memory_mcp.git
 cd buildautomata_memory_mcp_dev
 ```
 
@@ -302,8 +302,8 @@ pip install --upgrade mcp qdrant-client sentence-transformers
 ## Support
 
 ### Community Support (Free)
-- GitHub Issues: [Report bugs or request features](https://github.com/brucepro/buildautomata_memory_mcp_dev/issues)
-- Discussions: [Ask questions, share tips](https://github.com/brucepro/buildautomata_memory_mcp_dev/discussions)
+- GitHub Issues: [Report bugs or request features](https://github.com/brucepro/buildautomata_memory_mcp/issues)
+- Discussions: [Ask questions, share tips](https://github.com/brucepro/buildautomata_memory_mcp/discussions)
 
 ### Priority Support (Gumroad Customers)
 - Email: sales@brucepro.net
