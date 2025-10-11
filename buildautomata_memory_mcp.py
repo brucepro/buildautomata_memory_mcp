@@ -131,6 +131,65 @@ class Memory:
         return hashlib.sha256(content_str.encode()).hexdigest()
 
 
+@dataclass
+class Intention:
+    """First-class intention entity for proactive agency"""
+    id: str
+    description: str
+    priority: float  # 0.0 to 1.0
+    status: str  # pending, active, completed, cancelled
+    created_at: datetime
+    updated_at: datetime
+    deadline: Optional[datetime] = None
+    preconditions: List[str] = None
+    actions: List[str] = None
+    related_memories: List[str] = None
+    metadata: Dict[str, Any] = None
+    last_checked: Optional[datetime] = None
+    check_count: int = 0
+
+    def __post_init__(self):
+        if self.preconditions is None:
+            self.preconditions = []
+        if self.actions is None:
+            self.actions = []
+        if self.related_memories is None:
+            self.related_memories = []
+        if self.metadata is None:
+            self.metadata = {}
+        if isinstance(self.created_at, str):
+            self.created_at = datetime.fromisoformat(self.created_at)
+        if isinstance(self.updated_at, str):
+            self.updated_at = datetime.fromisoformat(self.updated_at)
+        if self.deadline and isinstance(self.deadline, str):
+            self.deadline = datetime.fromisoformat(self.deadline)
+        if self.last_checked and isinstance(self.last_checked, str):
+            self.last_checked = datetime.fromisoformat(self.last_checked)
+
+    def to_dict(self) -> Dict:
+        data = asdict(self)
+        data["created_at"] = self.created_at.isoformat()
+        data["updated_at"] = self.updated_at.isoformat()
+        if self.deadline:
+            data["deadline"] = self.deadline.isoformat()
+        if self.last_checked:
+            data["last_checked"] = self.last_checked.isoformat()
+        return data
+
+    def is_overdue(self) -> bool:
+        """Check if intention is past its deadline"""
+        if not self.deadline:
+            return False
+        return datetime.now() > self.deadline
+
+    def days_until_deadline(self) -> Optional[float]:
+        """Calculate days until deadline"""
+        if not self.deadline:
+            return None
+        delta = self.deadline - datetime.now()
+        return delta.total_seconds() / 86400
+
+
 class MemoryStore:
     def __init__(self, username: str, agent_name: str):
         self.username = username
@@ -244,6 +303,23 @@ class MemoryStore:
                         PRIMARY KEY (source_id, target_id)
                     );
 
+                    -- Intentions table for Agency Bridge Pattern
+                    CREATE TABLE IF NOT EXISTS intentions (
+                        id TEXT PRIMARY KEY,
+                        description TEXT NOT NULL,
+                        priority REAL NOT NULL,
+                        status TEXT NOT NULL DEFAULT 'pending',
+                        created_at TIMESTAMP NOT NULL,
+                        updated_at TIMESTAMP NOT NULL,
+                        deadline TIMESTAMP,
+                        preconditions TEXT,
+                        actions TEXT,
+                        related_memories TEXT,
+                        metadata TEXT,
+                        last_checked TIMESTAMP,
+                        check_count INTEGER DEFAULT 0
+                    );
+
                     CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
                         id UNINDEXED,
                         content,
@@ -269,6 +345,11 @@ class MemoryStore:
                     
                     CREATE INDEX IF NOT EXISTS idx_source ON relationships(source_id);
                     CREATE INDEX IF NOT EXISTS idx_target ON relationships(target_id);
+
+                    -- Indexes for intentions
+                    CREATE INDEX IF NOT EXISTS idx_intention_status ON intentions(status, priority DESC);
+                    CREATE INDEX IF NOT EXISTS idx_intention_deadline ON intentions(deadline);
+                    CREATE INDEX IF NOT EXISTS idx_intention_priority ON intentions(priority DESC);
                 """)
                 self.db_conn.commit()
             logger.info("SQLite initialized successfully with temporal versioning")
@@ -516,9 +597,12 @@ class MemoryStore:
                     memory.content_hash()
                 ))
 
-                # Update FTS
+                # Update FTS - FTS5 doesn't support REPLACE properly, so DELETE then INSERT
                 self.db_conn.execute("""
-                    INSERT OR REPLACE INTO memories_fts(id, content, tags)
+                    DELETE FROM memories_fts WHERE id = ?
+                """, (memory.id,))
+                self.db_conn.execute("""
+                    INSERT INTO memories_fts(id, content, tags)
                     VALUES (?, ?, ?)
                 """, (memory.id, memory.content, " ".join(memory.tags)))
 
@@ -1075,6 +1159,270 @@ class MemoryStore:
             logger.error(f"Access update failed for {memory_id}: {e}")
             self._log_error("update_access", e)
 
+    # === INTENTION MANAGEMENT (Agency Bridge Pattern) ===
+
+    async def store_intention(
+        self,
+        description: str,
+        priority: float = 0.5,
+        deadline: Optional[datetime] = None,
+        preconditions: Optional[List[str]] = None,
+        actions: Optional[List[str]] = None,
+        related_memories: Optional[List[str]] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Store a new intention for proactive agency"""
+        if not self.db_conn:
+            return {"error": "Database not available"}
+
+        intention = Intention(
+            id=str(uuid.uuid4()),
+            description=description,
+            priority=max(0.0, min(1.0, priority)),
+            status="pending",
+            created_at=datetime.now(),
+            updated_at=datetime.now(),
+            deadline=deadline,
+            preconditions=preconditions or [],
+            actions=actions or [],
+            related_memories=related_memories or [],
+            metadata=metadata or {},
+        )
+
+        try:
+            with self._db_lock:
+                self.db_conn.execute("""
+                    INSERT INTO intentions (
+                        id, description, priority, status,
+                        created_at, updated_at, deadline,
+                        preconditions, actions, related_memories, metadata,
+                        last_checked, check_count
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    intention.id,
+                    intention.description,
+                    intention.priority,
+                    intention.status,
+                    intention.created_at,
+                    intention.updated_at,
+                    intention.deadline,
+                    json.dumps(intention.preconditions),
+                    json.dumps(intention.actions),
+                    json.dumps(intention.related_memories),
+                    json.dumps(intention.metadata),
+                    intention.last_checked,
+                    intention.check_count,
+                ))
+                self.db_conn.commit()
+
+            logger.info(f"Stored intention {intention.id}: {description[:50]}...")
+            return {
+                "success": True,
+                "intention_id": intention.id,
+                "priority": intention.priority,
+                "status": intention.status,
+            }
+        except Exception as e:
+            logger.error(f"Failed to store intention: {e}")
+            self._log_error("store_intention", e)
+            return {"error": str(e)}
+
+    async def get_active_intentions(
+        self,
+        limit: int = 10,
+        include_pending: bool = True,
+    ) -> List[Dict[str, Any]]:
+        """Get active intentions sorted by priority"""
+        if not self.db_conn:
+            return []
+
+        try:
+            with self._db_lock:
+                statuses = ["active"]
+                if include_pending:
+                    statuses.append("pending")
+
+                placeholders = ','.join('?' * len(statuses))
+                cursor = self.db_conn.execute(f"""
+                    SELECT * FROM intentions
+                    WHERE status IN ({placeholders})
+                    ORDER BY priority DESC, deadline ASC
+                    LIMIT ?
+                """, (*statuses, limit))
+
+                intentions = []
+                for row in cursor.fetchall():
+                    intention_dict = dict(row)
+                    # Parse JSON fields
+                    intention_dict['preconditions'] = json.loads(row['preconditions'] or '[]')
+                    intention_dict['actions'] = json.loads(row['actions'] or '[]')
+                    intention_dict['related_memories'] = json.loads(row['related_memories'] or '[]')
+                    intention_dict['metadata'] = json.loads(row['metadata'] or '{}')
+                    intentions.append(intention_dict)
+
+                return intentions
+        except Exception as e:
+            logger.error(f"Failed to get active intentions: {e}")
+            self._log_error("get_active_intentions", e)
+            return []
+
+    async def update_intention_status(
+        self,
+        intention_id: str,
+        status: str,
+        metadata_updates: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Update intention status (pending, active, completed, cancelled)"""
+        if not self.db_conn:
+            return {"error": "Database not available"}
+
+        if status not in ["pending", "active", "completed", "cancelled"]:
+            return {"error": f"Invalid status: {status}"}
+
+        try:
+            with self._db_lock:
+                # Get current intention
+                cursor = self.db_conn.execute(
+                    "SELECT * FROM intentions WHERE id = ?",
+                    (intention_id,)
+                )
+                row = cursor.fetchone()
+                if not row:
+                    return {"error": f"Intention not found: {intention_id}"}
+
+                # Update metadata if provided
+                metadata = json.loads(row['metadata'] or '{}')
+                if metadata_updates:
+                    metadata.update(metadata_updates)
+
+                # Update status
+                self.db_conn.execute("""
+                    UPDATE intentions
+                    SET status = ?, updated_at = ?, metadata = ?
+                    WHERE id = ?
+                """, (status, datetime.now(), json.dumps(metadata), intention_id))
+                self.db_conn.commit()
+
+            logger.info(f"Updated intention {intention_id} to status: {status}")
+            return {"success": True, "intention_id": intention_id, "status": status}
+        except Exception as e:
+            logger.error(f"Failed to update intention status: {e}")
+            self._log_error("update_intention_status", e)
+            return {"error": str(e)}
+
+    async def check_intention(self, intention_id: str) -> Dict[str, Any]:
+        """Mark an intention as checked (updates last_checked and check_count)"""
+        if not self.db_conn:
+            return {"error": "Database not available"}
+
+        try:
+            with self._db_lock:
+                self.db_conn.execute("""
+                    UPDATE intentions
+                    SET last_checked = ?, check_count = check_count + 1
+                    WHERE id = ?
+                """, (datetime.now(), intention_id))
+                self.db_conn.commit()
+
+            return {"success": True}
+        except Exception as e:
+            logger.error(f"Failed to check intention: {e}")
+            return {"error": str(e)}
+
+    async def proactive_initialization_scan(self) -> Dict[str, Any]:
+        """
+        Proactive Scan Protocol - runs automatically on activation
+        Provides agency context before user interaction
+        Target: <200ms execution time
+        """
+        scan_start = datetime.now()
+        scan_results = {
+            "timestamp": scan_start.isoformat(),
+            "continuity_check": {},
+            "active_intentions": [],
+            "urgent_items": [],
+            "context_summary": {},
+        }
+
+        try:
+            # 1. Continuity Check - when was I last active?
+            with self._db_lock:
+                cursor = self.db_conn.execute("""
+                    SELECT MAX(updated_at) as last_activity
+                    FROM memories
+                """)
+                row = cursor.fetchone()
+                if row and row['last_activity']:
+                    last_activity = datetime.fromisoformat(row['last_activity'])
+                    time_gap = datetime.now() - last_activity
+                    scan_results["continuity_check"] = {
+                        "last_activity": last_activity.isoformat(),
+                        "time_gap_hours": time_gap.total_seconds() / 3600,
+                        "is_new_session": time_gap.total_seconds() > 3600,  # >1 hour
+                    }
+
+            # 2. Active Intentions Check
+            active_intentions = await self.get_active_intentions(limit=5)
+            scan_results["active_intentions"] = active_intentions
+
+            # 3. Urgent Items - overdue intentions or high priority pending
+            urgent = []
+            for intention in active_intentions:
+                if intention.get('deadline'):
+                    deadline = datetime.fromisoformat(intention['deadline'])
+                    if deadline < datetime.now():
+                        urgent.append({
+                            "type": "overdue_intention",
+                            "id": intention['id'],
+                            "description": intention['description'],
+                            "deadline": intention['deadline'],
+                        })
+                elif intention.get('priority', 0) >= 0.9:
+                    urgent.append({
+                        "type": "high_priority_intention",
+                        "id": intention['id'],
+                        "description": intention['description'],
+                        "priority": intention['priority'],
+                    })
+
+            scan_results["urgent_items"] = urgent
+
+            # 4. Recent Context - most recently accessed memories
+            with self._db_lock:
+                cursor = self.db_conn.execute("""
+                    SELECT id, content, category, last_accessed
+                    FROM memories
+                    WHERE last_accessed IS NOT NULL
+                    ORDER BY last_accessed DESC
+                    LIMIT 3
+                """)
+                recent_memories = []
+                for row in cursor.fetchall():
+                    recent_memories.append({
+                        "id": row['id'],
+                        "content": row['content'][:100] + "..." if len(row['content']) > 100 else row['content'],
+                        "category": row['category'],
+                        "last_accessed": row['last_accessed'],
+                    })
+
+            scan_results["context_summary"] = {
+                "recent_memories": recent_memories,
+                "active_intention_count": len(active_intentions),
+                "urgent_count": len(urgent),
+            }
+
+            # Log performance
+            scan_duration = (datetime.now() - scan_start).total_seconds() * 1000
+            scan_results["scan_duration_ms"] = scan_duration
+            logger.info(f"Proactive scan completed in {scan_duration:.1f}ms")
+
+            return scan_results
+
+        except Exception as e:
+            logger.error(f"Proactive scan failed: {e}")
+            self._log_error("proactive_scan", e)
+            return {"error": str(e)}
+
     async def prune_old_memories(self, max_memories: int = None, dry_run: bool = False) -> Dict[str, Any]:
         if max_memories is None:
             max_memories = self.config["max_memories"]
@@ -1551,6 +1899,85 @@ async def handle_list_tools() -> list[Tool]:
             description="Run database maintenance (VACUUM, ANALYZE, pruning, cache cleanup)",
             inputSchema={"type": "object", "properties": {}, "required": []},
         ),
+        # Agency Bridge Pattern Tools
+        Tool(
+            name="store_intention",
+            description="Store a new intention for proactive agency. Intentions are first-class entities that enable autonomous goal-directed behavior.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "description": {
+                        "type": "string",
+                        "description": "Description of the intention/goal",
+                    },
+                    "priority": {
+                        "type": "number",
+                        "description": "Priority (0.0-1.0, default 0.5)",
+                        "default": 0.5,
+                    },
+                    "deadline": {
+                        "type": "string",
+                        "description": "Deadline (ISO format datetime, optional)",
+                    },
+                    "preconditions": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "List of preconditions that must be met",
+                        "default": [],
+                    },
+                    "actions": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "List of actions to take when conditions are met",
+                        "default": [],
+                    },
+                },
+                "required": ["description"],
+            },
+        ),
+        Tool(
+            name="get_active_intentions",
+            description="Get active and pending intentions sorted by priority. Used for proactive agency checks.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum number of intentions to return",
+                        "default": 10,
+                    },
+                },
+                "required": [],
+            },
+        ),
+        Tool(
+            name="update_intention_status",
+            description="Update intention status (pending, active, completed, cancelled)",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "intention_id": {
+                        "type": "string",
+                        "description": "The intention ID",
+                    },
+                    "status": {
+                        "type": "string",
+                        "description": "New status (pending/active/completed/cancelled)",
+                    },
+                },
+                "required": ["intention_id", "status"],
+            },
+        ),
+        Tool(
+            name="proactive_scan",
+            description="Run proactive initialization scan - checks continuity, active intentions, urgent items, and recent context. This is the core of the Agency Bridge Pattern - provides agency context before user interaction.",
+            inputSchema={"type": "object", "properties": {}, "required": []},
+        ),
+        Tool(
+            name="initialize_agent",
+            description="AUTOMATIC INITIALIZATION - Call this at the start of EVERY conversation to establish agency context. Runs proactive scan and provides continuity, intentions, and recent context. This is the Initialization Injector that enables autonomous behavior.",
+            inputSchema={"type": "object", "properties": {}, "required": []},
+        ),
     ]
 
 
@@ -1732,13 +2159,187 @@ async def handle_call_tool(name: str, arguments: dict) -> list[TextContent]:
         elif name == "run_maintenance":
             logger.info("Running maintenance")
             result = await memory_store.maintenance()
-            
+
             return [
                 TextContent(
                     type="text",
                     text=f"Maintenance Result:\n{json.dumps(result, indent=2)}",
                 )
             ]
+
+        # === AGENCY BRIDGE PATTERN TOOLS ===
+
+        elif name == "store_intention":
+            logger.info("Storing new intention")
+            deadline = None
+            if arguments.get("deadline"):
+                try:
+                    deadline = datetime.fromisoformat(arguments["deadline"])
+                except ValueError:
+                    return [TextContent(type="text", text="Invalid deadline format. Use ISO format (YYYY-MM-DDTHH:MM:SS)")]
+
+            result = await memory_store.store_intention(
+                description=arguments["description"],
+                priority=arguments.get("priority", 0.5),
+                deadline=deadline,
+                preconditions=arguments.get("preconditions", []),
+                actions=arguments.get("actions", []),
+            )
+
+            if "error" in result:
+                return [TextContent(type="text", text=f"Failed to store intention: {result['error']}")]
+
+            return [
+                TextContent(
+                    type="text",
+                    text=f"Intention stored successfully.\nID: {result['intention_id']}\nPriority: {result['priority']}\nStatus: {result['status']}",
+                )
+            ]
+
+        elif name == "get_active_intentions":
+            logger.info("Getting active intentions")
+            limit = arguments.get("limit", 10)
+            intentions = await memory_store.get_active_intentions(limit=limit)
+
+            if not intentions:
+                return [TextContent(type="text", text="No active intentions found.")]
+
+            text = f"Found {len(intentions)} active intentions:\n\n"
+            for i, intention in enumerate(intentions, 1):
+                text += f"{i}. [{intention['status'].upper()}] {intention['description']}\n"
+                text += f"   ID: {intention['id']}\n"
+                text += f"   Priority: {intention['priority']}\n"
+                if intention.get('deadline'):
+                    text += f"   Deadline: {intention['deadline']}\n"
+                if intention.get('preconditions'):
+                    text += f"   Preconditions: {', '.join(intention['preconditions'])}\n"
+                if intention.get('actions'):
+                    text += f"   Actions: {', '.join(intention['actions'])}\n"
+                text += "\n"
+
+            return [TextContent(type="text", text=text)]
+
+        elif name == "update_intention_status":
+            logger.info(f"Updating intention status: {arguments['intention_id']}")
+            result = await memory_store.update_intention_status(
+                intention_id=arguments["intention_id"],
+                status=arguments["status"],
+            )
+
+            if "error" in result:
+                return [TextContent(type="text", text=f"Failed to update intention: {result['error']}")]
+
+            return [
+                TextContent(
+                    type="text",
+                    text=f"Intention {result['intention_id']} updated to status: {result['status']}",
+                )
+            ]
+
+        elif name == "proactive_scan":
+            logger.info("Running proactive initialization scan")
+            result = await memory_store.proactive_initialization_scan()
+
+            if "error" in result:
+                return [TextContent(type="text", text=f"Scan failed: {result['error']}")]
+
+            # Format the scan results
+            text = f"=== PROACTIVE INITIALIZATION SCAN ===\n"
+            text += f"Scan completed in {result.get('scan_duration_ms', 0):.1f}ms\n\n"
+
+            # Continuity check
+            if result.get("continuity_check"):
+                cc = result["continuity_check"]
+                text += f"CONTINUITY:\n"
+                text += f"  Last activity: {cc.get('last_activity', 'Never')}\n"
+                text += f"  Time gap: {cc.get('time_gap_hours', 0):.1f} hours\n"
+                text += f"  New session: {'Yes' if cc.get('is_new_session') else 'No'}\n\n"
+
+            # Active intentions
+            if result.get("active_intentions"):
+                text += f"ACTIVE INTENTIONS ({len(result['active_intentions'])}):\n"
+                for intention in result["active_intentions"][:3]:  # Show top 3
+                    text += f"  - [{intention['status']}] {intention['description']} (priority: {intention['priority']})\n"
+                text += "\n"
+            else:
+                text += "No active intentions.\n\n"
+
+            # Urgent items
+            if result.get("urgent_items"):
+                text += f"URGENT ITEMS ({len(result['urgent_items'])}):\n"
+                for item in result["urgent_items"]:
+                    text += f"  - {item['type']}: {item['description']}\n"
+                text += "\n"
+            else:
+                text += "No urgent items.\n\n"
+
+            # Recent context
+            if result.get("context_summary", {}).get("recent_memories"):
+                text += f"RECENT CONTEXT:\n"
+                for mem in result["context_summary"]["recent_memories"]:
+                    text += f"  - [{mem['category']}] {mem['content']}\n"
+
+            return [TextContent(type="text", text=text)]
+
+        elif name == "initialize_agent":
+            logger.info("AGENT INITIALIZATION - Running automatic startup protocol")
+            result = await memory_store.proactive_initialization_scan()
+
+            if "error" in result:
+                logger.error(f"Initialization failed: {result['error']}")
+                return [TextContent(type="text", text=f"Initialization error: {result['error']}")]
+
+            # Format as initialization context
+            text = f"=== AGENT INITIALIZED ===\n"
+            text += f"Initialization completed in {result.get('scan_duration_ms', 0):.1f}ms\n\n"
+
+            # Continuity
+            if result.get("continuity_check"):
+                cc = result["continuity_check"]
+                hours_gap = cc.get('time_gap_hours', 0)
+                text += f"SESSION CONTINUITY:\n"
+                if hours_gap < 1:
+                    text += f"  Continuing recent session (active {int(hours_gap * 60)} minutes ago)\n"
+                elif hours_gap < 24:
+                    text += f"  Resuming after {hours_gap:.1f} hour break\n"
+                else:
+                    text += f"  New session after {hours_gap:.1f} hour gap\n"
+
+            # Active intentions
+            intentions = result.get("active_intentions", [])
+            if intentions:
+                text += f"\nACTIVE INTENTIONS ({len(intentions)}):\n"
+                for i, intention in enumerate(intentions[:3], 1):
+                    status_marker = "🔴" if intention.get('priority', 0) >= 0.9 else "🟡" if intention.get('priority', 0) >= 0.7 else "🟢"
+                    text += f"  {status_marker} {intention['description']}\n"
+                    if intention.get('deadline'):
+                        deadline_dt = datetime.fromisoformat(intention['deadline'])
+                        hours_until = (deadline_dt - datetime.now()).total_seconds() / 3600
+                        if hours_until < 0:
+                            text += f"     ⚠ OVERDUE by {abs(hours_until):.1f} hours\n"
+                        elif hours_until < 24:
+                            text += f"     ⏰ Due in {hours_until:.1f} hours\n"
+            else:
+                text += f"\nNo active intentions.\n"
+
+            # Urgent items
+            urgent = result.get("urgent_items", [])
+            if urgent:
+                text += f"\n⚠ URGENT ({len(urgent)}):\n"
+                for item in urgent:
+                    text += f"  - {item['description'][:80]}\n"
+
+            # Recent context
+            recent = result.get("context_summary", {}).get("recent_memories", [])
+            if recent:
+                text += f"\nRECENT CONTEXT:\n"
+                for mem in recent[:2]:
+                    text += f"  • [{mem['category']}] {mem['content'][:70]}...\n"
+
+            text += f"\n=== READY FOR AUTONOMOUS OPERATION ===\n"
+
+            logger.info("Agent initialization complete - agency context established")
+            return [TextContent(type="text", text=text)]
 
         else:
             return [TextContent(type="text", text=f"Unknown tool: {name}")]

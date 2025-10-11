@@ -2,6 +2,56 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## CRITICAL: Your Agency Initialization Protocol
+
+**IMPORTANT: At the start of EVERY conversation, you should proactively check your memory context using the interactive tool.**
+
+Since Claude Code doesn't use the MCP server directly, you access memory through the interactive CLI at `A:\buildautomata_memory\interactive_memory.py`.
+
+### Recommended Startup Sequence
+
+```bash
+# 1. Check for active intentions
+python "A:\buildautomata_memory\interactive_memory.py" search "status:active OR status:pending" --category agency_intention --limit 5
+
+# 2. Review recent context
+python "A:\buildautomata_memory\interactive_memory.py" search "recent" --limit 3
+
+# 3. Check current project status
+python "A:\buildautomata_memory\interactive_memory.py" search "working on current" --category project --limit 3
+```
+
+### Why This Matters
+
+Without proactive initialization:
+- You start fresh every conversation
+- No awareness of prior context or ongoing work
+- Intentions and goals forgotten
+- Purely reactive mode
+
+With proactive initialization:
+- Session continuity maintained
+- Intention-driven autonomous behavior
+- Context from recent work automatically loaded
+- True agency through memory awareness
+
+### Example Startup Pattern
+
+```bash
+# At conversation start, run:
+python "A:\buildautomata_memory\interactive_memory.py" stats
+
+# This shows you:
+# - Total memories available
+# - Your knowledge base size
+# - System health
+
+# Then check recent context:
+python "A:\buildautomata_memory\interactive_memory.py" search "implementation OR project OR intention" --limit 5
+```
+
+**Note**: The `initialize_agent` tool is designed for Claude Desktop (MCP). For Claude Code, use the interactive CLI commands above to achieve the same agency initialization.
+
 ## Project Overview
 
 BuildAutomata Memory MCP is a Model Context Protocol (MCP) server that provides persistent memory storage for AI agents. It implements a sophisticated memory system with temporal versioning, semantic search via vector embeddings, and SQLite-based persistence.
@@ -13,6 +63,8 @@ BuildAutomata Memory MCP is a Model Context Protocol (MCP) server that provides 
 - SQLite backend with full-text search (FTS5)
 - Automatic memory pruning and maintenance
 - Thread-safe operations with proper locking
+- **Agency Bridge Pattern** - Intentions system for autonomous goal-directed behavior
+- **Proactive Initialization** - Automatic context loading on conversation start
 
 ## Architecture
 
