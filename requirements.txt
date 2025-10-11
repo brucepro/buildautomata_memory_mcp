@@ -1,0 +1,11 @@
+# Core MCP requirement
+mcp>=1.0.0
+
+# Optional but highly recommended for full functionality
+qdrant-client>=1.7.0
+sentence-transformers>=2.2.0
+
+# These are bundled with Python but listed for clarity
+# sqlite3 - built-in
+# asyncio - built-in
+# threading - built-in
