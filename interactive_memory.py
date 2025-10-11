@@ -364,7 +364,7 @@ Examples:
                     access_count = mem.get('access_count', 0)
 
                     print(f"{i}. [{mem_id}...] {category} (importance: {importance:.2f}, current: {current_imp:.2f})")
-                    print(f"   {content[]}")
+                    print(f"   {content}")
                     print(f"   Tags: {', '.join(tags) if tags else 'none'}")
                     print(f"   Created: {created_at}, Versions: {version_count}, Accessed: {access_count}x")
 
