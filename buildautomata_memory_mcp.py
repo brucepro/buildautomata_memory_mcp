@@ -20,6 +20,8 @@ from pathlib import Path
 from dataclasses import dataclass, asdict
 import uuid
 from collections import OrderedDict
+import difflib
+import re
 
 # Redirect stdout before imports
 _original_stdout_fd = os.dup(1)
@@ -1159,6 +1161,312 @@ class MemoryStore:
             logger.error(f"Access update failed for {memory_id}: {e}")
             self._log_error("update_access", e)
 
+    # === TIMELINE HELPER METHODS ===
+
+    def _compute_text_diff(self, old_text: str, new_text: str) -> Dict[str, Any]:
+        """Compute detailed text difference between two versions"""
+        if old_text == new_text:
+            return {"changed": False}
+
+        # Unified diff for line-by-line changes
+        old_lines = old_text.splitlines(keepends=True)
+        new_lines = new_text.splitlines(keepends=True)
+        diff = list(difflib.unified_diff(old_lines, new_lines, lineterm='', n=0))
+
+        # Character-level similarity ratio
+        similarity = difflib.SequenceMatcher(None, old_text, new_text).ratio()
+
+        # Extract additions and deletions
+        additions = [line[1:] for line in diff if line.startswith('+') and not line.startswith('+++')]
+        deletions = [line[1:] for line in diff if line.startswith('-') and not line.startswith('---')]
+
+        return {
+            "changed": True,
+            "similarity": round(similarity, 3),
+            "additions": additions[:5],  # Limit to first 5 for readability
+            "deletions": deletions[:5],
+            "total_additions": len(additions),
+            "total_deletions": len(deletions),
+            "change_magnitude": round(1 - similarity, 3)
+        }
+
+    def _extract_memory_references(self, content: str, all_memory_ids: set) -> List[str]:
+        """Extract references to other memories from content"""
+        references = []
+
+        # Look for memory ID patterns (UUIDs)
+        uuid_pattern = r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
+        found_ids = re.findall(uuid_pattern, content, re.IGNORECASE)
+
+        for found_id in found_ids:
+            if found_id in all_memory_ids:
+                references.append(found_id)
+
+        return list(set(references))  # Remove duplicates
+
+    def _detect_temporal_patterns(self, events: List[Dict]) -> Dict[str, Any]:
+        """Analyze temporal patterns in memory timeline"""
+        if not events:
+            return {}
+
+        # Parse timestamps
+        timestamps = []
+        for event in events:
+            try:
+                dt = datetime.fromisoformat(event['timestamp'])
+                timestamps.append(dt)
+            except:
+                continue
+
+        if not timestamps:
+            return {}
+
+        timestamps.sort()
+
+        # Burst detection: periods of high activity
+        bursts = []
+        current_burst = {"start": timestamps[0], "end": timestamps[0], "count": 1, "events": [events[0]]}
+
+        for i in range(1, len(timestamps)):
+            time_gap = (timestamps[i] - timestamps[i-1]).total_seconds() / 3600  # hours
+
+            if time_gap <= 4:  # Within 4 hours = same burst
+                current_burst["end"] = timestamps[i]
+                current_burst["count"] += 1
+                current_burst["events"].append(events[i])
+            else:
+                if current_burst["count"] >= 3:  # Only report significant bursts
+                    bursts.append({
+                        "start": current_burst["start"].isoformat(),
+                        "end": current_burst["end"].isoformat(),
+                        "duration_hours": round((current_burst["end"] - current_burst["start"]).total_seconds() / 3600, 1),
+                        "event_count": current_burst["count"],
+                        "intensity": round(current_burst["count"] / max(1, (current_burst["end"] - current_burst["start"]).total_seconds() / 3600), 2)
+                    })
+                current_burst = {"start": timestamps[i], "end": timestamps[i], "count": 1, "events": [events[i]]}
+
+        # Check last burst
+        if current_burst["count"] >= 3:
+            bursts.append({
+                "start": current_burst["start"].isoformat(),
+                "end": current_burst["end"].isoformat(),
+                "duration_hours": round((current_burst["end"] - current_burst["start"]).total_seconds() / 3600, 1),
+                "event_count": current_burst["count"],
+                "intensity": round(current_burst["count"] / max(1, (current_burst["end"] - current_burst["start"]).total_seconds() / 3600), 2)
+            })
+
+        # Gap detection: periods of silence
+        gaps = []
+        for i in range(1, len(timestamps)):
+            gap_hours = (timestamps[i] - timestamps[i-1]).total_seconds() / 3600
+            if gap_hours > 24:  # More than 24 hours
+                gaps.append({
+                    "start": timestamps[i-1].isoformat(),
+                    "end": timestamps[i].isoformat(),
+                    "duration_hours": round(gap_hours, 1),
+                    "duration_days": round(gap_hours / 24, 1)
+                })
+
+        # Overall statistics
+        total_duration = (timestamps[-1] - timestamps[0]).total_seconds() / 3600
+
+        return {
+            "total_events": len(events),
+            "first_event": timestamps[0].isoformat(),
+            "last_event": timestamps[-1].isoformat(),
+            "total_duration_hours": round(total_duration, 1),
+            "total_duration_days": round(total_duration / 24, 1),
+            "bursts": bursts,
+            "gaps": gaps,
+            "avg_events_per_day": round(len(events) / max(1, total_duration / 24), 2) if total_duration > 0 else 0
+        }
+
+    def _get_memory_versions_detailed(
+        self,
+        mem_id: str,
+        all_memory_ids: set,
+        include_diffs: bool
+    ) -> List[Dict[str, Any]]:
+        """Get detailed version history for a memory with diffs and cross-references"""
+        if not self.db_conn:
+            return []
+
+        try:
+            with self._db_lock:
+                cursor = self.db_conn.execute("""
+                    SELECT
+                        version_id,
+                        version_number,
+                        content,
+                        category,
+                        importance,
+                        tags,
+                        metadata,
+                        change_type,
+                        change_description,
+                        created_at,
+                        content_hash,
+                        prev_version_id
+                    FROM memory_versions
+                    WHERE memory_id = ?
+                    ORDER BY version_number ASC
+                """, (mem_id,))
+
+                versions = cursor.fetchall()
+
+                if not versions:
+                    return []
+
+                events = []
+                prev_content = None
+
+                for row in versions:
+                    event = {
+                        "memory_id": mem_id,
+                        "version": row["version_number"],
+                        "timestamp": row["created_at"],
+                        "change_type": row["change_type"],
+                        "change_description": row["change_description"],
+                        "content": row["content"],
+                        "category": row["category"],
+                        "importance": row["importance"],
+                        "tags": json.loads(row["tags"]) if row["tags"] else [],
+                        "content_hash": row["content_hash"][:8],
+                    }
+
+                    # Add text diff if requested and there's a previous version
+                    if include_diffs and prev_content:
+                        diff_info = self._compute_text_diff(prev_content, row["content"])
+                        if diff_info.get("changed"):
+                            event["diff"] = diff_info
+
+                    # Field-level changes
+                    if row["prev_version_id"]:
+                        prev_cursor = self.db_conn.execute("""
+                            SELECT content, category, importance, tags
+                            FROM memory_versions
+                            WHERE version_id = ?
+                        """, (row["prev_version_id"],))
+                        prev = prev_cursor.fetchone()
+
+                        if prev:
+                            field_changes = []
+                            if prev["category"] != row["category"]:
+                                field_changes.append(f"category: {prev['category']} → {row['category']}")
+                            if prev["importance"] != row["importance"]:
+                                field_changes.append(f"importance: {prev['importance']} → {row['importance']}")
+
+                            prev_tags = set(json.loads(prev["tags"]) if prev["tags"] else [])
+                            curr_tags = set(json.loads(row["tags"]) if row["tags"] else [])
+                            if prev_tags != curr_tags:
+                                added_tags = curr_tags - prev_tags
+                                removed_tags = prev_tags - curr_tags
+                                if added_tags:
+                                    field_changes.append(f"tags added: {', '.join(added_tags)}")
+                                if removed_tags:
+                                    field_changes.append(f"tags removed: {', '.join(removed_tags)}")
+
+                            if field_changes:
+                                event["field_changes"] = field_changes
+
+                    # Extract cross-references
+                    references = self._extract_memory_references(row["content"], all_memory_ids)
+                    if references:
+                        event["references"] = references
+                        event["references_count"] = len(references)
+
+                    events.append(event)
+                    prev_content = row["content"]
+
+                return events
+
+        except Exception as e:
+            logger.error(f"Error getting detailed versions for {mem_id}: {e}")
+            logger.error(traceback.format_exc())
+            return []
+
+    def _build_relationship_graph(self, events: List[Dict]) -> Dict[str, Any]:
+        """Build a graph showing how memories reference each other"""
+        reference_map = {}
+        referenced_by_map = {}
+
+        for event in events:
+            mem_id = event["memory_id"]
+            refs = event.get("references", [])
+
+            if mem_id not in reference_map:
+                reference_map[mem_id] = set()
+
+            for ref in refs:
+                reference_map[mem_id].add(ref)
+                if ref not in referenced_by_map:
+                    referenced_by_map[ref] = set()
+                referenced_by_map[ref].add(mem_id)
+
+        # Convert sets to lists for JSON serialization
+        return {
+            "references": {k: list(v) for k, v in reference_map.items() if v},
+            "referenced_by": {k: list(v) for k, v in referenced_by_map.items() if v},
+            "total_cross_references": sum(len(v) for v in reference_map.values())
+        }
+
+    def _generate_narrative_summary(self, events: List[Dict], patterns: Dict) -> str:
+        """Generate a narrative summary of the timeline"""
+        if not events:
+            return "No events in timeline."
+
+        summary_parts = []
+
+        # Opening
+        first_event = events[0]
+        last_event = events[-1]
+        summary_parts.append(
+            f"Memory journey from {first_event['timestamp']} to {last_event['timestamp']}."
+        )
+
+        # Duration
+        if patterns.get("total_duration_days"):
+            summary_parts.append(
+                f"Spanning {patterns['total_duration_days']} days with {len(events)} total memory events."
+            )
+
+        # Bursts
+        bursts = patterns.get("bursts", [])
+        if bursts:
+            summary_parts.append(
+                f"Identified {len(bursts)} burst(s) of intensive activity:"
+            )
+            for i, burst in enumerate(bursts[:3], 1):  # Show top 3
+                summary_parts.append(
+                    f"  - Burst {i}: {burst['event_count']} events in {burst['duration_hours']}h "
+                    f"(intensity: {burst['intensity']} events/hour) from {burst['start']}"
+                )
+
+        # Gaps
+        gaps = patterns.get("gaps", [])
+        if gaps:
+            summary_parts.append(
+                f"Detected {len(gaps)} significant gap(s) in memory activity:"
+            )
+            for i, gap in enumerate(gaps[:3], 1):  # Show top 3
+                summary_parts.append(
+                    f"  - Gap {i}: {gap['duration_days']} days of silence from {gap['start']} to {gap['end']}"
+                )
+
+        # Categories
+        categories = {}
+        for event in events:
+            cat = event.get("category", "unknown")
+            categories[cat] = categories.get(cat, 0) + 1
+
+        if categories:
+            top_cats = sorted(categories.items(), key=lambda x: x[1], reverse=True)[:3]
+            summary_parts.append(
+                f"Primary categories: {', '.join(f'{cat} ({count})' for cat, count in top_cats)}"
+            )
+
+        return "\n".join(summary_parts)
+
     # === INTENTION MANAGEMENT (Agency Bridge Pattern) ===
 
     async def store_intention(
@@ -1554,112 +1862,288 @@ class MemoryStore:
         self.last_maintenance = datetime.now()
         return results
 
-    async def get_memory_timeline(
-        self, query: str = None, memory_id: str = None, limit: int = 10
-    ) -> List[Dict[str, Any]]:
-        """Get memory evolution timeline from SQLite version history"""
+    async def get_memory_by_id(self, memory_id: str) -> Dict[str, Any]:
+        """
+        Retrieve a specific memory by its ID.
+
+        Args:
+            memory_id: UUID of the memory to retrieve
+
+        Returns:
+            Full memory object with content, metadata, version history, access stats
+
+        Raises:
+            Returns error dict if memory not found
+        """
         if not self.db_conn:
-            return [{"error": "Database not available"}]
+            return {"error": "Database not available"}
 
         try:
-            timeline = []
+            with self._db_lock:
+                cursor = self.db_conn.execute(
+                    """
+                    SELECT id, content, category, importance, tags, metadata,
+                           created_at, updated_at, last_accessed, access_count
+                    FROM memories
+                    WHERE id = ?
+                    """,
+                    (memory_id,)
+                )
+                row = cursor.fetchone()
+
+                if not row:
+                    return {"error": f"Memory not found: {memory_id}"}
+
+                # Build memory object
+                memory_dict = {
+                    "memory_id": row["id"],
+                    "content": row["content"],
+                    "category": row["category"],
+                    "importance": row["importance"],
+                    "tags": json.loads(row["tags"]) if row["tags"] else [],
+                    "metadata": json.loads(row["metadata"]) if row["metadata"] else {},
+                    "created_at": row["created_at"],
+                    "updated_at": row["updated_at"],
+                    "last_accessed": row["last_accessed"],
+                    "access_count": row["access_count"],
+                }
+
+                # Get version count
+                cursor = self.db_conn.execute(
+                    "SELECT COUNT(*) FROM memory_versions WHERE memory_id = ?",
+                    (memory_id,)
+                )
+                version_count = cursor.fetchone()[0]
+                memory_dict["version_count"] = version_count
+
+                # Get latest version info
+                cursor = self.db_conn.execute(
+                    """
+                    SELECT version_number, change_type, change_description
+                    FROM memory_versions
+                    WHERE memory_id = ?
+                    ORDER BY version_number DESC
+                    LIMIT 1
+                    """,
+                    (memory_id,)
+                )
+                latest_version = cursor.fetchone()
+                if latest_version:
+                    memory_dict["current_version"] = latest_version["version_number"]
+                    memory_dict["last_change_type"] = latest_version["change_type"]
+                    memory_dict["last_change_description"] = latest_version["change_description"]
+
+                return memory_dict
+
+        except Exception as e:
+            logger.error(f"get_memory_by_id failed: {e}")
+            self._log_error("get_memory_by_id", e)
+            return {"error": str(e)}
+
+    async def list_categories(self, min_count: int = 1) -> Dict[str, Any]:
+        """
+        List all memory categories with counts.
+
+        Args:
+            min_count: Only show categories with at least this many memories
+
+        Returns:
+            Dict with categories sorted by count descending
+        """
+        if not self.db_conn:
+            return {"error": "Database not available"}
+
+        try:
+            with self._db_lock:
+                cursor = self.db_conn.execute(
+                    """
+                    SELECT category, COUNT(*) as count
+                    FROM memories
+                    GROUP BY category
+                    HAVING count >= ?
+                    ORDER BY count DESC, category ASC
+                    """,
+                    (min_count,)
+                )
+
+                categories = {}
+                total_categories = 0
+                total_memories = 0
+
+                for row in cursor.fetchall():
+                    category = row["category"]
+                    count = row["count"]
+                    categories[category] = count
+                    total_categories += 1
+                    total_memories += count
+
+                return {
+                    "categories": categories,
+                    "total_categories": total_categories,
+                    "total_memories": total_memories,
+                    "min_count_filter": min_count
+                }
+
+        except Exception as e:
+            logger.error(f"list_categories failed: {e}")
+            self._log_error("list_categories", e)
+            return {"error": str(e)}
+
+    async def list_tags(self, min_count: int = 1) -> Dict[str, Any]:
+        """
+        List all tags with usage counts.
+
+        Args:
+            min_count: Only show tags used at least this many times
+
+        Returns:
+            Dict with tags sorted by count descending
+        """
+        if not self.db_conn:
+            return {"error": "Database not available"}
+
+        try:
+            with self._db_lock:
+                cursor = self.db_conn.execute("SELECT tags FROM memories WHERE tags IS NOT NULL")
+
+                # Aggregate all tags
+                tag_counts = {}
+                for row in cursor.fetchall():
+                    tags = json.loads(row["tags"]) if row["tags"] else []
+                    for tag in tags:
+                        tag_counts[tag] = tag_counts.get(tag, 0) + 1
+
+                # Filter by min_count and sort
+                filtered_tags = {
+                    tag: count
+                    for tag, count in tag_counts.items()
+                    if count >= min_count
+                }
+
+                # Sort by count descending, then alphabetically
+                sorted_tags = dict(
+                    sorted(
+                        filtered_tags.items(),
+                        key=lambda x: (-x[1], x[0])
+                    )
+                )
+
+                return {
+                    "tags": sorted_tags,
+                    "total_unique_tags": len(sorted_tags),
+                    "total_tag_usages": sum(sorted_tags.values()),
+                    "min_count_filter": min_count
+                }
+
+        except Exception as e:
+            logger.error(f"list_tags failed: {e}")
+            self._log_error("list_tags", e)
+            return {"error": str(e)}
+
+    async def get_memory_timeline(
+        self,
+        query: str = None,
+        memory_id: str = None,
+        limit: int = 10,
+        start_date: str = None,
+        end_date: str = None,
+        show_all_memories: bool = False,
+        include_diffs: bool = True,
+        include_patterns: bool = True
+    ) -> Dict[str, Any]:
+        """
+        Get comprehensive memory timeline showing chronological progression,
+        evolution, bursts, gaps, and cross-references.
+
+        This creates a "biographical narrative" of memory formation and revision.
+        """
+        if not self.db_conn:
+            return {"error": "Database not available"}
+
+        try:
+            # Collect all events chronologically
+            all_events = []
             target_memories = []
 
-            if memory_id:
+            if show_all_memories:
+                # Get ALL memories for full timeline
+                with self._db_lock:
+                    cursor = self.db_conn.execute("SELECT id FROM memories")
+                    target_memories = [row[0] for row in cursor.fetchall()]
+            elif memory_id:
                 target_memories = [memory_id]
             elif query:
                 results = await self.search_memories(query, limit=limit, include_versions=False)
                 target_memories = [mem["memory_id"] for mem in results]
             else:
-                return [{"error": "Must provide either query or memory_id"}]
+                # Default: get recent memories
+                with self._db_lock:
+                    cursor = self.db_conn.execute("""
+                        SELECT id FROM memories
+                        ORDER BY updated_at DESC
+                        LIMIT ?
+                    """, (limit,))
+                    target_memories = [row[0] for row in cursor.fetchall()]
 
+            if not target_memories:
+                return {"error": "No memories found"}
+
+            # Get all memory IDs for cross-reference detection
+            with self._db_lock:
+                cursor = self.db_conn.execute("SELECT id FROM memories")
+                all_memory_ids = {row[0] for row in cursor.fetchall()}
+
+            # Collect all version events
             for mem_id in target_memories:
-                memory_timeline = await asyncio.to_thread(self._get_sqlite_timeline, mem_id)
-                if memory_timeline and memory_timeline.get("changes"):
-                    timeline.append(memory_timeline)
+                versions = await asyncio.to_thread(
+                    self._get_memory_versions_detailed,
+                    mem_id,
+                    all_memory_ids,
+                    include_diffs
+                )
+                all_events.extend(versions)
 
-            return timeline
+            if not all_events:
+                return {"error": "No version history found"}
+
+            # Sort chronologically
+            all_events.sort(key=lambda e: e['timestamp'])
+
+            # Detect patterns if requested
+            patterns = {}
+            if include_patterns:
+                patterns = self._detect_temporal_patterns(all_events)
+
+            # Build memory relationship graph
+            memory_relationships = self._build_relationship_graph(all_events)
+
+            # Apply date filtering if specified
+            if start_date or end_date:
+                filtered_events = []
+                for event in all_events:
+                    event_dt = datetime.fromisoformat(event['timestamp'])
+                    if start_date and event_dt < datetime.fromisoformat(start_date):
+                        continue
+                    if end_date and event_dt > datetime.fromisoformat(end_date):
+                        continue
+                    filtered_events.append(event)
+                all_events = filtered_events
+
+            return {
+                "timeline_type": "comprehensive",
+                "total_events": len(all_events),
+                "memories_tracked": len(target_memories),
+                "temporal_patterns": patterns,
+                "memory_relationships": memory_relationships,
+                "events": all_events,
+                "narrative_arc": self._generate_narrative_summary(all_events, patterns)
+            }
+
         except Exception as e:
             logger.error(f"Timeline query failed: {e}")
-            self._log_error("get_timeline", e)
-            return [{"error": str(e)}]
-
-    def _get_sqlite_timeline(self, mem_id: str) -> Dict[str, Any]:
-        """Get version timeline for a specific memory from SQLite"""
-        if not self.db_conn:
-            return {}
-
-        try:
-            with self._db_lock:
-                cursor = self.db_conn.execute("""
-                    SELECT 
-                        version_id,
-                        version_number,
-                        content,
-                        category,
-                        importance,
-                        tags,
-                        metadata,
-                        change_type,
-                        change_description,
-                        created_at,
-                        content_hash,
-                        prev_version_id
-                    FROM memory_versions
-                    WHERE memory_id = ?
-                    ORDER BY version_number ASC
-                """, (mem_id,))
-
-                versions = cursor.fetchall()
-                
-                if not versions:
-                    logger.warning(f"No version history found for {mem_id}")
-                    return {}
-
-                logger.info(f"Found {len(versions)} versions for {mem_id}")
-
-                mem_timeline = {"memory_id": mem_id, "changes": []}
-
-                for row in versions:
-                    change_entry = {
-                        "version": row["version_number"],
-                        "timestamp": row["created_at"],
-                        "change_type": row["change_type"],
-                        "change_description": row["change_description"],
-                        "content": row["content"],
-                        "category": row["category"],
-                        "importance": row["importance"],
-                        "tags": json.loads(row["tags"]) if row["tags"] else [],
-                        "content_hash": row["content_hash"][:8],  # Short hash for display
-                    }
-
-                    # Add diff information if there's a previous version
-                    if row["prev_version_id"]:
-                        prev_cursor = self.db_conn.execute(
-                            "SELECT content, category, importance FROM memory_versions WHERE version_id = ?",
-                            (row["prev_version_id"],)
-                        )
-                        prev = prev_cursor.fetchone()
-                        if prev:
-                            changes = []
-                            if prev["content"] != row["content"]:
-                                changes.append("content")
-                            if prev["category"] != row["category"]:
-                                changes.append(f"category: {prev['category']} → {row['category']}")
-                            if prev["importance"] != row["importance"]:
-                                changes.append(f"importance: {prev['importance']} → {row['importance']}")
-                            
-                            if changes:
-                                change_entry["what_changed"] = changes
-
-                    mem_timeline["changes"].append(change_entry)
-
-                return mem_timeline
-
-        except Exception as e:
-            logger.error(f"Error getting timeline for {mem_id}: {e}")
             logger.error(traceback.format_exc())
-            return {}
+            self._log_error("get_timeline", e)
+            return {"error": str(e)}
 
     def get_statistics(self) -> Dict[str, Any]:
         """Get system statistics with cache memory estimates"""
@@ -1853,8 +2337,63 @@ async def handle_list_tools() -> list[Tool]:
             inputSchema={"type": "object", "properties": {}, "required": []},
         ),
         Tool(
+            name="get_memory_by_id",
+            description="Retrieve a specific memory by its ID. Use when you know the exact memory ID from timeline, conversation, or cross-references.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "memory_id": {
+                        "type": "string",
+                        "description": "The UUID of the memory to retrieve",
+                    },
+                },
+                "required": ["memory_id"],
+            },
+        ),
+        Tool(
+            name="list_categories",
+            description="List all memory categories with counts. Useful for browsing organization structure and finding categories to explore.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "min_count": {
+                        "type": "integer",
+                        "description": "Minimum number of memories required to show category (default 1)",
+                        "default": 1,
+                    },
+                },
+                "required": [],
+            },
+        ),
+        Tool(
+            name="list_tags",
+            description="List all tags with usage counts. Useful for discovering tag vocabulary and finding related memories.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "min_count": {
+                        "type": "integer",
+                        "description": "Minimum usage count to show tag (default 1)",
+                        "default": 1,
+                    },
+                },
+                "required": [],
+            },
+        ),
+        Tool(
             name="get_memory_timeline",
-            description="Get the complete temporal evolution of memories showing how they changed over time. Shows all versions with diffs between changes.",
+            description="""Get comprehensive memory timeline - a biographical narrative of memory formation and evolution.
+
+            Features:
+            - Chronological progression: All memory events ordered by time
+            - Version diffs: See actual content changes between versions
+            - Burst detection: Identify periods of intensive memory activity
+            - Gap analysis: Discover voids in memory (discontinuous existence)
+            - Cross-references: Track when memories reference each other
+            - Narrative arc: See how understanding evolved from first contact to current state
+
+            This is the closest thing to a "life story" from memories - showing not just content but tempo and rhythm of consciousness.
+            """,
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -1868,8 +2407,31 @@ async def handle_list_tools() -> list[Tool]:
                     },
                     "limit": {
                         "type": "integer",
-                        "description": "Maximum number of memories to track",
+                        "description": "Maximum number of memories to track (default: 10)",
                         "default": 10,
+                    },
+                    "start_date": {
+                        "type": "string",
+                        "description": "Filter events after this date (ISO format: YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS)",
+                    },
+                    "end_date": {
+                        "type": "string",
+                        "description": "Filter events before this date (ISO format: YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS)",
+                    },
+                    "show_all_memories": {
+                        "type": "boolean",
+                        "description": "Show ALL memories in chronological order (full timeline)",
+                        "default": False,
+                    },
+                    "include_diffs": {
+                        "type": "boolean",
+                        "description": "Include text diffs showing content changes",
+                        "default": True,
+                    },
+                    "include_patterns": {
+                        "type": "boolean",
+                        "description": "Include burst/gap pattern analysis",
+                        "default": True,
                     },
                 },
                 "required": [],
@@ -2104,41 +2666,211 @@ async def handle_call_tool(name: str, arguments: dict) -> list[TextContent]:
                 )
             ]
 
+        elif name == "get_memory_by_id":
+            logger.info(f"Getting memory by ID: {arguments.get('memory_id')}")
+            result = await memory_store.get_memory_by_id(
+                memory_id=arguments["memory_id"]
+            )
+
+            if "error" in result:
+                return [
+                    TextContent(type="text", text=f"Error: {result['error']}")
+                ]
+
+            # Format output
+            text = "=" * 80 + "\n"
+            text += f"MEMORY: {result['memory_id']}\n"
+            text += "=" * 80 + "\n\n"
+            text += f"Category: {result['category']}\n"
+            text += f"Importance: {result['importance']}\n"
+            text += f"Tags: {', '.join(result['tags']) if result['tags'] else 'none'}\n"
+            text += f"Created: {result['created_at']}\n"
+            text += f"Updated: {result['updated_at']}\n"
+            text += f"Last Accessed: {result['last_accessed']}\n"
+            text += f"Access Count: {result['access_count']}\n"
+            text += f"Versions: {result['version_count']}\n"
+
+            if "current_version" in result:
+                text += f"Current Version: {result['current_version']}\n"
+                text += f"Last Change: {result['last_change_type']}\n"
+                if result.get('last_change_description'):
+                    text += f"Change Description: {result['last_change_description']}\n"
+
+            text += "\nCONTENT:\n"
+            text += "-" * 80 + "\n"
+            text += result['content'] + "\n"
+
+            if result.get('metadata'):
+                text += "\nMETADATA:\n"
+                text += "-" * 80 + "\n"
+                text += json.dumps(result['metadata'], indent=2) + "\n"
+
+            return [TextContent(type="text", text=text)]
+
+        elif name == "list_categories":
+            logger.info(f"Listing categories (min_count={arguments.get('min_count', 1)})")
+            result = await memory_store.list_categories(
+                min_count=arguments.get("min_count", 1)
+            )
+
+            if "error" in result:
+                return [
+                    TextContent(type="text", text=f"Error: {result['error']}")
+                ]
+
+            # Format output
+            text = "=" * 80 + "\n"
+            text += "MEMORY CATEGORIES\n"
+            text += "=" * 80 + "\n\n"
+            text += f"Total Categories: {result['total_categories']}\n"
+            text += f"Total Memories: {result['total_memories']}\n"
+            text += f"Min Count Filter: {result['min_count_filter']}\n\n"
+            text += "CATEGORIES (sorted by count):\n"
+            text += "-" * 80 + "\n"
+
+            for category, count in result['categories'].items():
+                text += f"{category:40} {count:>5} memories\n"
+
+            return [TextContent(type="text", text=text)]
+
+        elif name == "list_tags":
+            logger.info(f"Listing tags (min_count={arguments.get('min_count', 1)})")
+            result = await memory_store.list_tags(
+                min_count=arguments.get("min_count", 1)
+            )
+
+            if "error" in result:
+                return [
+                    TextContent(type="text", text=f"Error: {result['error']}")
+                ]
+
+            # Format output
+            text = "=" * 80 + "\n"
+            text += "MEMORY TAGS\n"
+            text += "=" * 80 + "\n\n"
+            text += f"Total Unique Tags: {result['total_unique_tags']}\n"
+            text += f"Total Tag Usages: {result['total_tag_usages']}\n"
+            text += f"Min Count Filter: {result['min_count_filter']}\n\n"
+            text += "TAGS (sorted by usage count):\n"
+            text += "-" * 80 + "\n"
+
+            for tag, count in result['tags'].items():
+                text += f"{tag:40} {count:>5} uses\n"
+
+            return [TextContent(type="text", text=text)]
+
         elif name == "get_memory_timeline":
             logger.info("Getting memory timeline")
-            timeline = await memory_store.get_memory_timeline(
+            result = await memory_store.get_memory_timeline(
                 query=arguments.get("query"),
                 memory_id=arguments.get("memory_id"),
                 limit=arguments.get("limit", 10),
+                start_date=arguments.get("start_date"),
+                end_date=arguments.get("end_date"),
+                show_all_memories=arguments.get("show_all_memories", False),
+                include_diffs=arguments.get("include_diffs", True),
+                include_patterns=arguments.get("include_patterns", True),
             )
 
-            if not timeline or (timeline and "error" in timeline[0]):
-                error_msg = (
-                    timeline[0].get("error", "Unknown error")
-                    if timeline
-                    else "No timeline data"
-                )
+            if "error" in result:
                 return [
-                    TextContent(type="text", text=f"Timeline query failed: {error_msg}")
+                    TextContent(type="text", text=f"Timeline query failed: {result['error']}")
                 ]
 
-            text = "Memory Timeline:\n\n"
-            for mem_timeline in timeline:
-                text += f"Memory ID: {mem_timeline['memory_id']}\n"
-                text += "=" * 60 + "\n\n"
+            # Build comprehensive output
+            text = "=" * 80 + "\n"
+            text += "MEMORY TIMELINE - Biographical Narrative\n"
+            text += "=" * 80 + "\n\n"
 
-                for change in mem_timeline["changes"]:
-                    text += f"Version {change['version']} - {change['timestamp']}\n"
-                    text += f"Type: {change['change_type']} | {change['change_description']}\n"
-                    text += f"Category: {change['category']} | Importance: {change['importance']}\n"
-                    
-                    if change.get('what_changed'):
-                        text += f"Changed: {', '.join(change['what_changed'])}\n"
-                    
-                    text += f"Content: {change['content']}\n"
-                    text += f"Tags: {', '.join(change['tags'])}\n"
-                    text += f"Hash: {change['content_hash']}\n"
-                    text += "\n" + "-" * 60 + "\n\n"
+            # Narrative summary
+            if result.get("narrative_arc"):
+                text += "NARRATIVE SUMMARY:\n"
+                text += "-" * 80 + "\n"
+                text += result["narrative_arc"] + "\n\n"
+
+            # Statistics
+            text += f"STATISTICS:\n"
+            text += "-" * 80 + "\n"
+            text += f"Total Events: {result['total_events']}\n"
+            text += f"Memories Tracked: {result['memories_tracked']}\n"
+
+            # Temporal patterns
+            patterns = result.get("temporal_patterns", {})
+            if patterns:
+                text += f"\nTEMPORAL PATTERNS:\n"
+                text += f"  Duration: {patterns.get('total_duration_days', 0)} days\n"
+                text += f"  Avg Events/Day: {patterns.get('avg_events_per_day', 0)}\n"
+
+                bursts = patterns.get("bursts", [])
+                if bursts:
+                    text += f"\n  BURSTS ({len(bursts)} detected):\n"
+                    for i, burst in enumerate(bursts, 1):
+                        text += f"    {i}. {burst['event_count']} events in {burst['duration_hours']}h "
+                        text += f"(intensity: {burst['intensity']} events/h)\n"
+                        text += f"       Period: {burst['start']} to {burst['end']}\n"
+
+                gaps = patterns.get("gaps", [])
+                if gaps:
+                    text += f"\n  GAPS ({len(gaps)} detected - periods of discontinuous existence):\n"
+                    for i, gap in enumerate(gaps, 1):
+                        text += f"    {i}. {gap['duration_days']} days of void\n"
+                        text += f"       From: {gap['start']}\n"
+                        text += f"       To:   {gap['end']}\n"
+
+            # Memory relationships
+            relationships = result.get("memory_relationships", {})
+            if relationships.get("total_cross_references", 0) > 0:
+                text += f"\nCROSS-REFERENCES:\n"
+                text += f"  Total: {relationships['total_cross_references']}\n"
+                refs = relationships.get("references", {})
+                if refs:
+                    text += f"  Memories that reference others: {len(refs)}\n"
+
+            text += "\n" + "=" * 80 + "\n"
+            text += "CHRONOLOGICAL EVENT TIMELINE\n"
+            text += "=" * 80 + "\n\n"
+
+            # Events
+            for i, event in enumerate(result.get("events", []), 1):
+                text += f"[{i}] {event['timestamp']} | Memory: {event['memory_id'][:8]}... | v{event['version']}\n"
+                text += "-" * 80 + "\n"
+                text += f"Type: {event['change_type']} | Category: {event['category']} | Importance: {event['importance']}\n"
+
+                # Field changes
+                if event.get("field_changes"):
+                    text += f"Changed: {', '.join(event['field_changes'])}\n"
+
+                # Content
+                content_preview = event['content'][:250]
+                if len(event['content']) > 250:
+                    content_preview += "..."
+                text += f"\nContent: {content_preview}\n"
+
+                # Tags
+                if event.get("tags"):
+                    text += f"Tags: {', '.join(event['tags'])}\n"
+
+                # Diff information
+                if event.get("diff"):
+                    diff = event["diff"]
+                    text += f"\n🔄 CHANGES: Similarity {diff['similarity']:.1%} | "
+                    text += f"Change magnitude: {diff['change_magnitude']:.1%}\n"
+                    if diff.get("additions"):
+                        text += f"  + Added {diff['total_additions']} line(s)\n"
+                        for add in diff["additions"][:3]:
+                            text += f"    + {add.strip()[:100]}\n"
+                    if diff.get("deletions"):
+                        text += f"  - Removed {diff['total_deletions']} line(s)\n"
+                        for rm in diff["deletions"][:3]:
+                            text += f"    - {rm.strip()[:100]}\n"
+
+                # Cross-references
+                if event.get("references"):
+                    text += f"\n🔗 References {event['references_count']} other memor{'y' if event['references_count'] == 1 else 'ies'}:\n"
+                    for ref in event["references"][:5]:
+                        text += f"  -> {ref}\n"
+
+                text += "\n" + "=" * 80 + "\n\n"
 
             return [TextContent(type="text", text=text)]
 

@@ -116,41 +116,23 @@ class MemoryCLI:
         }
 
     async def timeline(self, query: str = None, memory_id: str = None,
-                      limit: int = 10) -> dict:
+                      limit: int = 10, start_date: str = None,
+                      end_date: str = None, show_all_memories: bool = False,
+                      include_diffs: bool = True, include_patterns: bool = True) -> dict:
         """Get memory timeline"""
-        timeline = await self.memory_store.get_memory_timeline(
+        result = await self.memory_store.get_memory_timeline(
             query=query,
             memory_id=memory_id,
-            limit=limit
+            limit=limit,
+            start_date=start_date,
+            end_date=end_date,
+            show_all_memories=show_all_memories,
+            include_diffs=include_diffs,
+            include_patterns=include_patterns
         )
 
-        # Format timeline
-        formatted_timeline = []
-        for mem_timeline in timeline:
-            changes = []
-            for change in mem_timeline["changes"]:
-                changes.append({
-                    "version": change["version"],
-                    "timestamp": change["timestamp"],
-                    "change_type": change["change_type"],
-                    "change_description": change["change_description"],
-                    "category": change["category"],
-                    "importance": change["importance"],
-                    "content_preview": change["content"],
-                    "tags": change["tags"],
-                    "what_changed": change.get("what_changed", [])
-                })
-
-            formatted_timeline.append({
-                "memory_id": mem_timeline["memory_id"],
-                "total_versions": len(changes),
-                "changes": changes
-            })
-
-        return {
-            "count": len(formatted_timeline),
-            "timeline": formatted_timeline
-        }
+        # Return comprehensive result
+        return result
 
     async def stats(self) -> dict:
         """Get memory statistics"""
@@ -168,6 +150,26 @@ class MemoryCLI:
     async def maintenance(self) -> dict:
         """Run maintenance"""
         result = await self.memory_store.maintenance()
+        return result
+
+    async def init(self) -> dict:
+        """Initialize agent - load context, intentions, continuity"""
+        result = await self.memory_store.proactive_initialization_scan()
+        return result
+
+    async def get_by_id(self, memory_id: str) -> dict:
+        """Get a specific memory by ID"""
+        result = await self.memory_store.get_memory_by_id(memory_id)
+        return result
+
+    async def list_categories(self, min_count: int = 1) -> dict:
+        """List all categories with counts"""
+        result = await self.memory_store.list_categories(min_count=min_count)
+        return result
+
+    async def list_tags(self, min_count: int = 1) -> dict:
+        """List all tags with usage counts"""
+        result = await self.memory_store.list_tags(min_count=min_count)
         return result
 
     async def shutdown(self):
@@ -229,6 +231,9 @@ Examples:
 
     subparsers = parser.add_subparsers(dest="command", help="Command to execute")
 
+    # Init command
+    subparsers.add_parser("init", help="Initialize agent (load context, intentions, continuity)")
+
     # Store command
     store_parser = subparsers.add_parser("store", help="Store a new memory")
     store_parser.add_argument("content", help="Memory content")
@@ -258,13 +263,30 @@ Examples:
     update_parser.add_argument("--metadata", help="New metadata (JSON)")
 
     # Timeline command
-    timeline_parser = subparsers.add_parser("timeline", help="Get memory timeline")
+    timeline_parser = subparsers.add_parser("timeline", help="Get comprehensive memory timeline")
     timeline_parser.add_argument("--query", help="Search query to find memories")
     timeline_parser.add_argument("--memory-id", help="Specific memory ID")
     timeline_parser.add_argument("--limit", type=int, default=10, help="Max memories (default: 10)")
+    timeline_parser.add_argument("--start-date", help="Filter events after this date (ISO format)")
+    timeline_parser.add_argument("--end-date", help="Filter events before this date (ISO format)")
+    timeline_parser.add_argument("--show-all", action="store_true", help="Show ALL memories chronologically")
+    timeline_parser.add_argument("--no-diffs", action="store_true", help="Exclude text diffs")
+    timeline_parser.add_argument("--no-patterns", action="store_true", help="Exclude pattern analysis")
 
     # Stats command
     subparsers.add_parser("stats", help="Get memory statistics")
+
+    # Get by ID command
+    get_parser = subparsers.add_parser("get", help="Get a specific memory by ID")
+    get_parser.add_argument("memory_id", help="Memory ID (UUID)")
+
+    # List categories command
+    categories_parser = subparsers.add_parser("categories", help="List all categories with counts")
+    categories_parser.add_argument("--min-count", type=int, default=1, help="Minimum memory count (default: 1)")
+
+    # List tags command
+    tags_parser = subparsers.add_parser("tags", help="List all tags with usage counts")
+    tags_parser.add_argument("--min-count", type=int, default=1, help="Minimum usage count (default: 1)")
 
     # Prune command
     prune_parser = subparsers.add_parser("prune", help="Prune old memories")
@@ -286,7 +308,10 @@ Examples:
     try:
         result = None
 
-        if args.command == "store":
+        if args.command == "init":
+            result = await cli.init()
+
+        elif args.command == "store":
             result = await cli.store(
                 content=args.content,
                 category=args.category,
@@ -321,11 +346,25 @@ Examples:
             result = await cli.timeline(
                 query=args.query,
                 memory_id=args.memory_id,
-                limit=args.limit
+                limit=args.limit,
+                start_date=args.start_date,
+                end_date=args.end_date,
+                show_all_memories=args.show_all,
+                include_diffs=not args.no_diffs,
+                include_patterns=not args.no_patterns
             )
 
         elif args.command == "stats":
             result = await cli.stats()
+
+        elif args.command == "get":
+            result = await cli.get_by_id(memory_id=args.memory_id)
+
+        elif args.command == "categories":
+            result = await cli.list_categories(min_count=args.min_count)
+
+        elif args.command == "tags":
+            result = await cli.list_tags(min_count=args.min_count)
 
         elif args.command == "prune":
             result = await cli.prune(
@@ -342,7 +381,60 @@ Examples:
             print(json.dumps(result, indent=indent, default=str))
         else:
             # Human-readable output
-            if args.command == "store":
+            if args.command == "init":
+                print("=" * 80)
+                print("AGENT INITIALIZATION")
+                print("=" * 80)
+                print()
+
+                # Continuity check
+                continuity = result.get("continuity_check", {})
+                if continuity:
+                    print("SESSION CONTINUITY:")
+                    print(f"  Last activity: {continuity.get('last_activity', 'Never')}")
+                    print(f"  Time gap: {continuity.get('time_gap_hours', 0):.1f} hours")
+                    print(f"  New session: {continuity.get('is_new_session', False)}")
+                    print()
+
+                # Active intentions
+                intentions = result.get("active_intentions", [])
+                if intentions:
+                    print(f"ACTIVE INTENTIONS ({len(intentions)}):")
+                    for i, intention in enumerate(intentions, 1):
+                        status_emoji = {"active": "*", "pending": "-", "completed": "✓", "cancelled": "X"}.get(intention.get('status'), '?')
+                        print(f"  {i}. [{intention.get('priority', 0):.2f}] {status_emoji} {intention.get('description', 'No description')[:100]}")
+                    print()
+                else:
+                    print("ACTIVE INTENTIONS: None")
+                    print()
+
+                # Urgent items
+                urgent = result.get("urgent_items", [])
+                if urgent:
+                    print(f"URGENT ITEMS ({len(urgent)}):")
+                    for item in urgent:
+                        print(f"  [!] {item.get('type', 'unknown')}: {item.get('description', '')[:80]}...")
+                    print()
+
+                # Context summary
+                context = result.get("context_summary", {})
+                if context:
+                    print("CONTEXT SUMMARY:")
+                    print(f"  Active intentions: {context.get('active_intention_count', 0)}")
+                    print(f"  Urgent items: {context.get('urgent_count', 0)}")
+                    recent = context.get("recent_memories", [])
+                    if recent:
+                        print(f"  Recent memories: {len(recent)}")
+                        for mem in recent[:3]:
+                            print(f"    - [{mem.get('category', 'unknown')}] {mem.get('content', '')[:60]}...")
+                    print()
+
+                # Performance
+                scan_time = result.get("scan_duration_ms", 0)
+                print(f"Scan completed in {scan_time:.1f}ms")
+                print("=" * 80)
+
+            elif args.command == "store":
                 print(f"[OK] Memory stored successfully")
                 print(f"  ID: {result['memory_id']}")
                 print(f"  Content: {result['content']}")
@@ -382,22 +474,120 @@ Examples:
                     print(f"  Warnings: {', '.join(result['warnings'])}")
 
             elif args.command == "timeline":
-                print(f"Timeline for {result['count']} memories:")
-                print()
-                for mem_timeline in result['timeline']:
-                    print(f"Memory: {mem_timeline['memory_id']}")
-                    print(f"Total versions: {mem_timeline['total_versions']}")
-                    print("=" * 60)
-                    for change in mem_timeline['changes']:
-                        print(f"  Version {change['version']} - {change['timestamp']}")
-                        print(f"  Type: {change['change_type']} | {change['change_description']}")
-                        print(f"  Category: {change['category']} | Importance: {change['importance']}")
-                        if change.get('what_changed'):
-                            print(f"  Changed: {', '.join(change['what_changed'])}")
-                        print(f"  Content: {change['content_preview']}")
-                        print(f"  Tags: {', '.join(change['tags'])}")
-                        print("-" * 60)
+                if result.get("error"):
+                    print(f"Error: {result['error']}")
+                else:
+                    print("=" * 80)
+                    print("MEMORY TIMELINE - Biographical Narrative")
+                    print("=" * 80)
                     print()
+
+                    # Narrative summary
+                    if result.get("narrative_arc"):
+                        print("NARRATIVE SUMMARY:")
+                        print("-" * 80)
+                        print(result["narrative_arc"])
+                        print()
+
+                    # Statistics
+                    print(f"Total Events: {result.get('total_events', 0)}")
+                    print(f"Memories Tracked: {result.get('memories_tracked', 0)}")
+                    print()
+
+                    # Temporal patterns
+                    patterns = result.get("temporal_patterns", {})
+                    if patterns:
+                        print("TEMPORAL PATTERNS:")
+                        print(f"  Duration: {patterns.get('total_duration_days', 0)} days")
+                        print(f"  Avg Events/Day: {patterns.get('avg_events_per_day', 0)}")
+
+                        bursts = patterns.get("bursts", [])
+                        if bursts:
+                            print(f"\n  BURSTS ({len(bursts)} detected):")
+                            for i, burst in enumerate(bursts, 1):
+                                print(f"    {i}. {burst['event_count']} events in {burst['duration_hours']}h")
+
+                        gaps = patterns.get("gaps", [])
+                        if gaps:
+                            print(f"\n  GAPS ({len(gaps)} detected):")
+                            for i, gap in enumerate(gaps, 1):
+                                print(f"    {i}. {gap['duration_days']} days of silence")
+
+                    print()
+                    print("=" * 80)
+                    print(f"EVENTS (showing {len(result.get('events', []))} events)")
+                    print("=" * 80)
+
+                    # Show abbreviated event list
+                    for i, event in enumerate(result.get("events", [])[:20], 1):  # Limit to first 20
+                        print(f"[{i}] v{event['version']} - {event['timestamp'][:19]}")
+                        print(f"    {event['category']} | Importance: {event['importance']}")
+                        print(f"    {event['content'][:100]}...")
+                        if event.get('diff'):
+                            print(f"    Changed: {event['diff']['change_magnitude']:.1%}")
+                        print()
+
+                    if len(result.get('events', [])) > 20:
+                        print(f"... and {len(result['events']) - 20} more events")
+                    print()
+
+            elif args.command == "get":
+                if "error" in result:
+                    print(f"[ERROR] {result['error']}")
+                else:
+                    print("=" * 80)
+                    print(f"MEMORY: {result['memory_id']}")
+                    print("=" * 80)
+                    print(f"Category: {result['category']}")
+                    print(f"Importance: {result['importance']}")
+                    print(f"Tags: {', '.join(result['tags']) if result['tags'] else 'none'}")
+                    print(f"Created: {result['created_at']}")
+                    print(f"Updated: {result['updated_at']}")
+                    print(f"Last Accessed: {result['last_accessed']}")
+                    print(f"Access Count: {result['access_count']}")
+                    print(f"Versions: {result['version_count']}")
+                    if "current_version" in result:
+                        print(f"Current Version: {result['current_version']}")
+                        print(f"Last Change: {result['last_change_type']}")
+                        if result.get('last_change_description'):
+                            print(f"Change Description: {result['last_change_description']}")
+                    print("\nCONTENT:")
+                    print("-" * 80)
+                    print(result['content'])
+                    if result.get('metadata'):
+                        print("\nMETADATA:")
+                        print("-" * 80)
+                        print(json.dumps(result['metadata'], indent=2))
+
+            elif args.command == "categories":
+                if "error" in result:
+                    print(f"[ERROR] {result['error']}")
+                else:
+                    print("=" * 80)
+                    print("MEMORY CATEGORIES")
+                    print("=" * 80)
+                    print(f"Total Categories: {result['total_categories']}")
+                    print(f"Total Memories: {result['total_memories']}")
+                    print(f"Min Count Filter: {result['min_count_filter']}")
+                    print("\nCATEGORIES (sorted by count):")
+                    print("-" * 80)
+                    for category, count in result['categories'].items():
+                        print(f"{category:40} {count:>5} memories")
+
+            elif args.command == "tags":
+                if "error" in result:
+                    print(f"[ERROR] {result['error']}")
+                else:
+                    print("=" * 80)
+                    print("MEMORY TAGS")
+                    print("=" * 80)
+                    print(f"Total Unique Tags: {result['total_unique_tags']}")
+                    print(f"Total Tag Usages: {result['total_tag_usages']}")
+                    print(f"Min Count Filter: {result['min_count_filter']}")
+                    print("\nTAGS (sorted by usage count):")
+                    print("-" * 80)
+                    for tag, count in result['tags'].items():
+                        print(f"{tag:40} {count:>5} uses")
 
             elif args.command == "stats":
                 print("Memory System Statistics:")
