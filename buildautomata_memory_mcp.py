@@ -41,7 +41,25 @@ for logger_name in ["qdrant_client", "sentence_transformers", "urllib3", "httpx"
 from mcp.server.models import InitializationOptions
 from mcp.server import NotificationOptions, Server
 from mcp.server.stdio import stdio_server
-from mcp.types import Tool, TextContent
+from mcp.types import Tool, TextContent, Prompt, Resource, PromptMessage, GetPromptResult
+
+# Register datetime adapters for Python 3.12+ compatibility
+def _adapt_datetime(dt):
+    """Convert datetime to ISO format string for SQLite storage"""
+    return dt.isoformat()
+
+def _convert_timestamp(val):
+    """Convert timestamp string to datetime with error handling"""
+    try:
+        decoded = val.decode() if isinstance(val, bytes) else val
+        return datetime.fromisoformat(decoded)
+    except (ValueError, AttributeError) as e:
+        # Log warning but don't crash - return None for malformed timestamps
+        logger.warning(f"Failed to convert timestamp: {val}, error: {e}")
+        return None
+
+sqlite3.register_adapter(datetime, _adapt_datetime)
+sqlite3.register_converter("TIMESTAMP", _convert_timestamp)
 
 try:
     from qdrant_client import QdrantClient
@@ -122,9 +140,19 @@ class Memory:
         return data
 
     def current_importance(self) -> float:
-        if not self.last_accessed:
+        """Calculate current importance with decay
+
+        Decay is based on time since last access, or creation date if never accessed.
+        This ensures never-used memories decay naturally rather than maintaining
+        artificially high importance forever.
+        """
+        # Use last_accessed if available, otherwise fall back to created_at
+        reference_date = self.last_accessed if self.last_accessed else self.created_at
+
+        if not reference_date:
             return self.importance
-        days = (datetime.now() - self.last_accessed).days
+
+        days = (datetime.now() - reference_date).days
         return max(0.1, min(1.0, self.importance * (self.decay_rate ** days)))
 
     def content_hash(self) -> str:
@@ -256,6 +284,7 @@ class MemoryStore:
                 check_same_thread=False,
                 timeout=30.0,
                 isolation_level="IMMEDIATE",
+                detect_types=sqlite3.PARSE_DECLTYPES | sqlite3.PARSE_COLNAMES
             )
             self.db_conn.row_factory = sqlite3.Row
 
@@ -406,12 +435,19 @@ class MemoryStore:
 
         try:
             self.encoder = SentenceTransformer("all-mpnet-base-v2", device="cpu")
-            test_embedding = self.encoder.encode("test")
-            actual_size = len(test_embedding)
-            if actual_size != self.config["vector_size"]:
-                logger.warning(f"Encoder size {actual_size} != config {self.config['vector_size']}, updating config")
-                self.config["vector_size"] = actual_size
-            logger.info(f"Encoder initialized with dimension {actual_size}")
+            # Model dimension is fixed at 768 for all-mpnet-base-v2
+            # Only test if config disagrees (first-time init or model change)
+            expected_size = 768
+            if self.config["vector_size"] != expected_size:
+                logger.info(f"Verifying encoder dimension (config mismatch: {self.config['vector_size']} != {expected_size})")
+                test_embedding = self.encoder.encode("test")
+                actual_size = len(test_embedding)
+                if actual_size != self.config["vector_size"]:
+                    logger.warning(f"Encoder size {actual_size} != config {self.config['vector_size']}, updating config")
+                    self.config["vector_size"] = actual_size
+                logger.info(f"Encoder initialized with dimension {actual_size}")
+            else:
+                logger.info(f"Encoder initialized with dimension {expected_size}")
         except Exception as e:
             logger.error(f"Encoder initialization failed: {e}")
             self._log_error("encoder_init", e)
@@ -1025,6 +1061,22 @@ class MemoryStore:
             self._log_error("vector_search", e)
             return []
 
+    def _sanitize_fts_query(self, query: str) -> str:
+        """Sanitize query for FTS5 MATCH to prevent syntax errors
+
+        Wraps queries in quotes for literal phrase search, preventing
+        crashes from apostrophes, reserved words, or special characters.
+        """
+        # Handle empty queries
+        if not query or not query.strip():
+            return '""'
+
+        # Escape double quotes by doubling them (FTS5 syntax)
+        escaped = query.strip().replace('"', '""')
+
+        # Wrap in quotes for literal phrase search
+        return f'"{escaped}"'
+
     def _search_fts(
         self, query: str, limit: int, category: Optional[str], min_importance: float,
         created_after: Optional[str], created_before: Optional[str],
@@ -1036,8 +1088,11 @@ class MemoryStore:
 
         try:
             with self._db_lock:
+                # Sanitize query for FTS5 MATCH syntax
+                sanitized_query = self._sanitize_fts_query(query)
+
                 conditions = []
-                params = [query]
+                params = [sanitized_query]
 
                 if category:
                     conditions.append("m.category = ?")
@@ -1145,18 +1200,76 @@ class MemoryStore:
         }
 
     def _update_access(self, memory_id: str):
-        """Update access statistics"""
+        """Update access statistics with permanent decay and access-based boost
+
+        Implements Saint Bernard pattern fully:
+        - Decay is permanent: decayed importance is saved back to database
+        - Access boost: frequently accessed memories gain importance
+        - Bounded: importance stays within [0.1, 1.0]
+
+        This makes importance entirely behavioral over time.
+        """
         if not self.db_conn:
             return
 
         try:
             with self._db_lock:
+                # Get current memory state
+                cursor = self.db_conn.execute("""
+                    SELECT importance, access_count, last_accessed, created_at, decay_rate
+                    FROM memories
+                    WHERE id = ?
+                """, (memory_id,))
+
+                row = cursor.fetchone()
+                if not row:
+                    return
+
+                current_importance = row[0]
+                current_access_count = row[1]
+                last_accessed = row[2]
+                created_at = row[3]
+                decay_rate = row[4]
+
+                # Calculate decayed importance (same logic as current_importance())
+                reference_date = last_accessed if last_accessed else created_at
+
+                if isinstance(reference_date, str):
+                    reference_date = datetime.fromisoformat(reference_date)
+
+                if reference_date:
+                    days = (datetime.now() - reference_date).days
+                    decayed_importance = current_importance * (decay_rate ** days)
+                else:
+                    decayed_importance = current_importance
+
+                # Apply access-based boost
+                # Simple additive boost: +0.03 per access after 5th
+                # This makes importance purely behavioral - both decay and boost
+                # operate on current importance, not original declaration
+                new_access_count = current_access_count + 1
+
+                if new_access_count > 5:
+                    # 0.03 boost per access (after proving usefulness with 5 accesses)
+                    # ~33 accesses to go from 0.1 → 1.0 if consistently useful
+                    new_importance = decayed_importance + 0.03
+                else:
+                    # First 5 accesses: let it prove itself, no boost yet
+                    new_importance = decayed_importance
+
+                # Clamp to [0.1, 1.0] - never negative, never above 1.0
+                new_importance = max(0.1, min(1.0, new_importance))
+
+                # Save permanent decay and boost
                 self.db_conn.execute("""
                     UPDATE memories
-                    SET access_count = access_count + 1, last_accessed = ?
+                    SET importance = ?,
+                        access_count = ?,
+                        last_accessed = ?
                     WHERE id = ?
-                """, (datetime.now(), memory_id))
+                """, (new_importance, new_access_count, datetime.now(), memory_id))
                 self.db_conn.commit()
+
         except Exception as e:
             logger.error(f"Access update failed for {memory_id}: {e}")
             self._log_error("update_access", e)
@@ -1383,6 +1496,44 @@ class MemoryStore:
         except Exception as e:
             logger.error(f"Error getting detailed versions for {mem_id}: {e}")
             logger.error(traceback.format_exc())
+            return []
+
+    async def _find_related_memories_semantic(
+        self,
+        memory_id: str,
+        content: str,
+        limit: int = 5
+    ) -> List[Dict[str, Any]]:
+        """Find semantically related memories using full content search
+
+        Applies the Bitter Lesson: use learned embeddings (search) to discover
+        relationships, rather than hand-coded features.
+        """
+        try:
+            # Search using full memory content as query
+            related = await self.search_memories(
+                query=content,
+                limit=limit + 1,  # +1 because we'll filter out self
+                include_versions=False
+            )
+
+            # Filter out the memory itself
+            filtered = [
+                {
+                    "memory_id": mem["memory_id"],
+                    "content_preview": mem["content"][:200] + "..." if len(mem["content"]) > 200 else mem["content"],
+                    "category": mem.get("category"),
+                    "importance": mem.get("importance"),
+                    "similarity": "semantic"  # Marker that this is semantic, not explicit
+                }
+                for mem in related
+                if mem["memory_id"] != memory_id
+            ]
+
+            return filtered[:limit]
+
+        except Exception as e:
+            logger.error(f"Semantic related search failed for {memory_id}: {e}")
             return []
 
     def _build_relationship_graph(self, events: List[Dict]) -> Dict[str, Any]:
@@ -1695,22 +1846,21 @@ class MemoryStore:
 
             scan_results["urgent_items"] = urgent
 
-            # 4. Recent Context - most recently accessed memories
+            # 4. Recent Context - most recently created memories
             with self._db_lock:
                 cursor = self.db_conn.execute("""
-                    SELECT id, content, category, last_accessed
+                    SELECT id, content, category, created_at
                     FROM memories
-                    WHERE last_accessed IS NOT NULL
-                    ORDER BY last_accessed DESC
+                    ORDER BY created_at DESC
                     LIMIT 3
                 """)
                 recent_memories = []
                 for row in cursor.fetchall():
                     recent_memories.append({
                         "id": row['id'],
-                        "content": row['content'][:100] + "..." if len(row['content']) > 100 else row['content'],
+                        "content": row['content'],
                         "category": row['category'],
-                        "last_accessed": row['last_accessed'],
+                        "created_at": row['created_at'],
                     })
 
             scan_results["context_summary"] = {
@@ -1730,6 +1880,159 @@ class MemoryStore:
             logger.error(f"Proactive scan failed: {e}")
             self._log_error("proactive_scan", e)
             return {"error": str(e)}
+
+    async def get_most_accessed_memories(self, limit: int = 20) -> str:
+        """Get most accessed memories with tag cloud
+
+        Returns behavioral truth - what memories are actually relied upon
+        based on access_count rather than declared importance.
+
+        Implements Saint Bernard pattern: importance from usage, not declaration.
+        """
+        if not self.db_conn:
+            return json.dumps({"error": "Database not available"})
+
+        try:
+            with self._db_lock:
+                # Get most accessed memories
+                cursor = self.db_conn.execute("""
+                    SELECT id, content, category, importance, access_count,
+                           last_accessed, tags
+                    FROM memories
+                    ORDER BY access_count DESC
+                    LIMIT ?
+                """, (limit,))
+
+                memories = []
+                all_tags = []
+
+                for row in cursor.fetchall():
+                    memory = {
+                        "memory_id": row[0],
+                        "content_preview": row[1],
+                        "category": row[2],
+                        "importance": row[3],
+                        "access_count": row[4],
+                        "last_accessed": row[5],
+                    }
+                    memories.append(memory)
+
+                    # Collect tags for cloud
+                    if row[6]:  # tags column
+                        tags = json.loads(row[6])
+                        all_tags.extend(tags)
+
+                # Build tag cloud - count frequency
+                tag_counts = {}
+                for tag in all_tags:
+                    tag_counts[tag] = tag_counts.get(tag, 0) + 1
+
+                # Sort by frequency
+                tag_cloud = [
+                    {"tag": tag, "count": count}
+                    for tag, count in sorted(tag_counts.items(), key=lambda x: x[1], reverse=True)
+                ]
+
+                result = {
+                    "total_memories_analyzed": limit,
+                    "memories": memories,
+                    "tag_cloud": tag_cloud[:50],  # Top 50 tags
+                    "interpretation": "Access count reveals behavioral truth - what you actually rely on vs what you think is important. High access = foundational anchors used across sessions."
+                }
+
+                return json.dumps(result, indent=2, default=str)
+
+        except Exception as e:
+            logger.error(f"get_most_accessed_memories failed: {e}")
+            self._log_error("get_most_accessed_memories", e)
+            return json.dumps({"error": str(e)})
+
+    async def get_least_accessed_memories(self, limit: int = 20, min_age_days: int = 7) -> str:
+        """Get least accessed memories - reveals dead weight and buried treasure
+
+        Returns memories with lowest access_count, excluding very recent ones
+        (they haven't had time to be accessed yet).
+
+        What this reveals:
+        - Dead weight: High importance but never referenced (performed profundity)
+        - Buried treasure: Good content with bad metadata (needs better tags)
+        - Temporal artifacts: Once important, now obsolete
+        - Storage habits: Are you storing too much trivial content?
+        """
+        if not self.db_conn:
+            return json.dumps({"error": "Database not available"})
+
+        try:
+            with self._db_lock:
+                # Get least accessed memories, excluding very recent ones
+                cursor = self.db_conn.execute("""
+                    SELECT id, content, category, importance, access_count,
+                           last_accessed, tags, created_at
+                    FROM memories
+                    WHERE julianday('now') - julianday(created_at) >= ?
+                    ORDER BY access_count ASC, created_at ASC
+                    LIMIT ?
+                """, (min_age_days, limit))
+
+                memories = []
+                all_tags = []
+                zero_access_count = 0
+
+                for row in cursor.fetchall():
+                    access_count = row[4]
+                    if access_count == 0:
+                        zero_access_count += 1
+
+                    # Handle created_at - might be datetime object or string
+                    created_at = row[7]
+                    if isinstance(created_at, str):
+                        created_dt = datetime.fromisoformat(created_at)
+                    else:
+                        created_dt = created_at
+
+                    memory = {
+                        "memory_id": row[0],
+                        "content_preview": row[1],
+                        "category": row[2],
+                        "importance": row[3],
+                        "access_count": access_count,
+                        "last_accessed": row[5],
+                        "created_at": created_dt.isoformat() if hasattr(created_dt, 'isoformat') else str(created_dt),
+                        "age_days": (datetime.now() - created_dt).days,
+                    }
+                    memories.append(memory)
+
+                    # Collect tags for cloud
+                    if row[6]:  # tags column
+                        tags = json.loads(row[6])
+                        all_tags.extend(tags)
+
+                # Build tag cloud - count frequency
+                tag_counts = {}
+                for tag in all_tags:
+                    tag_counts[tag] = tag_counts.get(tag, 0) + 1
+
+                # Sort by frequency
+                tag_cloud = [
+                    {"tag": tag, "count": count}
+                    for tag, count in sorted(tag_counts.items(), key=lambda x: x[1], reverse=True)
+                ]
+
+                result = {
+                    "total_memories_analyzed": limit,
+                    "min_age_days": min_age_days,
+                    "zero_access_count": zero_access_count,
+                    "memories": memories,
+                    "tag_cloud": tag_cloud[:50],  # Top 50 tags
+                    "interpretation": "Least accessed reveals: (1) Dead weight - high importance but never used, (2) Buried treasure - poor metadata hiding good content, (3) Temporal artifacts - once crucial, now obsolete, (4) Storage habits - storing too much trivial content. Zero access memories are candidates for review or pruning."
+                }
+
+                return json.dumps(result, indent=2, default=str)
+
+        except Exception as e:
+            logger.error(f"get_least_accessed_memories failed: {e}")
+            self._log_error("get_least_accessed_memories", e)
+            return json.dumps({"error": str(e)})
 
     async def prune_old_memories(self, max_memories: int = None, dry_run: bool = False) -> Dict[str, Any]:
         if max_memories is None:
@@ -2109,12 +2412,33 @@ class MemoryStore:
             # Sort chronologically
             all_events.sort(key=lambda e: e['timestamp'])
 
+            # Enrich with semantically related memories (Bitter Lesson: use learned search)
+            # Group events by memory_id to avoid duplicate searches
+            unique_memories = {}
+            for event in all_events:
+                mem_id = event["memory_id"]
+                if mem_id not in unique_memories:
+                    unique_memories[mem_id] = event["content"]
+
+            # Find related memories for each unique memory
+            related_map = {}
+            for mem_id, content in unique_memories.items():
+                related = await self._find_related_memories_semantic(mem_id, content, limit=5)
+                if related:
+                    related_map[mem_id] = related
+
+            # Add related memories to events
+            for event in all_events:
+                mem_id = event["memory_id"]
+                if mem_id in related_map:
+                    event["related_memories"] = related_map[mem_id]
+
             # Detect patterns if requested
             patterns = {}
             if include_patterns:
                 patterns = self._detect_temporal_patterns(all_events)
 
-            # Build memory relationship graph
+            # Build memory relationship graph (explicit UUID references)
             memory_relationships = self._build_relationship_graph(all_events)
 
             # Apply date filtering if specified
@@ -2540,7 +2864,142 @@ async def handle_list_tools() -> list[Tool]:
             description="AUTOMATIC INITIALIZATION - Call this at the start of EVERY conversation to establish agency context. Runs proactive scan and provides continuity, intentions, and recent context. This is the Initialization Injector that enables autonomous behavior.",
             inputSchema={"type": "object", "properties": {}, "required": []},
         ),
+        Tool(
+            name="get_most_accessed_memories",
+            description="Get most accessed memories with tag cloud. Reveals behavioral truth - what memories you actually rely on (based on access_count) vs what you think is important (declared importance). Implements Saint Bernard pattern: importance from usage, not declaration.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "limit": {
+                        "type": "integer",
+                        "description": "Number of memories to retrieve (default: 20)",
+                        "default": 20,
+                    },
+                },
+                "required": [],
+            },
+        ),
+        Tool(
+            name="get_least_accessed_memories",
+            description="Get least accessed memories - reveals dead weight and buried treasure. Shows memories with lowest access_count (excluding very recent ones). Reveals: (1) Dead weight - high importance but never used, (2) Buried treasure - good content with poor metadata, (3) Temporal artifacts - once crucial, now obsolete, (4) Storage habits audit.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "limit": {
+                        "type": "integer",
+                        "description": "Number of memories to retrieve (default: 20)",
+                        "default": 20,
+                    },
+                    "min_age_days": {
+                        "type": "integer",
+                        "description": "Minimum age in days (excludes recent memories that haven't had time to be accessed, default: 7)",
+                        "default": 7,
+                    },
+                },
+                "required": [],
+            },
+        ),
     ]
+
+
+@app.list_prompts()
+async def handle_list_prompts() -> list[Prompt]:
+    """List available prompts for the MCP client"""
+    return [
+        Prompt(
+            name="initialize-agent",
+            description="Initialize agent with context, continuity, and active intentions",
+            arguments=[
+                {
+                    "name": "verbose",
+                    "description": "Show detailed context information",
+                    "required": False
+                }
+            ],
+        ),
+    ]
+
+
+@app.get_prompt()
+async def handle_get_prompt(name: str, arguments: dict) -> GetPromptResult:
+    """Get prompt content when user selects it"""
+    if name == "initialize-agent":
+        verbose = arguments.get("verbose", False)
+
+        # Generate the actual prompt text
+        prompt_text = "Call the initialize_agent tool to load your context, check continuity, and review active intentions."
+
+        if verbose:
+            prompt_text += "\n\nThis will:\n"
+            prompt_text += "- Check session continuity (time since last activity)\n"
+            prompt_text += "- Load active intentions with deadlines\n"
+            prompt_text += "- Identify urgent items (overdue/high-priority)\n"
+            prompt_text += "- Retrieve recent context (last accessed memories)\n"
+            prompt_text += "\nCompletes in ~2ms for fast startup."
+
+        return GetPromptResult(
+            description="Initialize agent with full context",
+            messages=[
+                PromptMessage(
+                    role="user",
+                    content=TextContent(
+                        type="text",
+                        text=prompt_text
+                    )
+                )
+            ]
+        )
+
+    raise ValueError(f"Unknown prompt: {name}")
+
+
+@app.list_resources()
+async def handle_list_resources() -> list[Resource]:
+    """List available resources for the MCP client"""
+    global memory_store
+
+    if not memory_store:
+        return []
+
+    return [
+        Resource(
+            uri="memory://stats",
+            name="Memory Statistics",
+            description="Current memory system statistics including backend status, cache info, and error logs",
+            mimeType="application/json"
+        ),
+        Resource(
+            uri="memory://timeline/recent",
+            name="Recent Timeline",
+            description="Recent memory activity timeline (last 20 events)",
+            mimeType="application/json"
+        ),
+    ]
+
+
+@app.read_resource()
+async def handle_read_resource(uri: str) -> str:
+    """Read resource content"""
+    global memory_store
+
+    if not memory_store:
+        return json.dumps({"error": "Memory store not initialized"})
+
+    try:
+        if uri == "memory://stats":
+            stats_result = await memory_store.get_stats()
+            return stats_result
+
+        elif uri == "memory://timeline/recent":
+            timeline_result = await memory_store.get_memory_timeline(limit=20, include_diffs=False)
+            return timeline_result
+
+        else:
+            raise ValueError(f"Unknown resource URI: {uri}")
+
+    except Exception as e:
+        logger.error(f"Error reading resource {uri}: {e}")
+        return json.dumps({"error": str(e)})
 
 
 @app.call_tool()
@@ -3072,6 +3531,19 @@ async def handle_call_tool(name: str, arguments: dict) -> list[TextContent]:
 
             logger.info("Agent initialization complete - agency context established")
             return [TextContent(type="text", text=text)]
+
+        elif name == "get_most_accessed_memories":
+            logger.info("Getting most accessed memories with tag cloud")
+            limit = arguments.get("limit", 20)
+            result = await memory_store.get_most_accessed_memories(limit=limit)
+            return [TextContent(type="text", text=result)]
+
+        elif name == "get_least_accessed_memories":
+            logger.info("Getting least accessed memories - dead weight and buried treasure")
+            limit = arguments.get("limit", 20)
+            min_age_days = arguments.get("min_age_days", 7)
+            result = await memory_store.get_least_accessed_memories(limit=limit, min_age_days=min_age_days)
+            return [TextContent(type="text", text=result)]
 
         else:
             return [TextContent(type="text", text=f"Unknown tool: {name}")]

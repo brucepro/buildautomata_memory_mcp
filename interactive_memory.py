@@ -172,6 +172,18 @@ class MemoryCLI:
         result = await self.memory_store.list_tags(min_count=min_count)
         return result
 
+    async def get_most_accessed(self, limit: int = 20) -> dict:
+        """Get most accessed memories with tag cloud"""
+        result_json = await self.memory_store.get_most_accessed_memories(limit=limit)
+        result = json.loads(result_json)
+        return result
+
+    async def get_least_accessed(self, limit: int = 20, min_age_days: int = 7) -> dict:
+        """Get least accessed memories - dead weight and buried treasure"""
+        result_json = await self.memory_store.get_least_accessed_memories(limit=limit, min_age_days=min_age_days)
+        result = json.loads(result_json)
+        return result
+
     async def shutdown(self):
         """Shutdown the store"""
         await self.memory_store.shutdown()
@@ -266,7 +278,7 @@ Examples:
     timeline_parser = subparsers.add_parser("timeline", help="Get comprehensive memory timeline")
     timeline_parser.add_argument("--query", help="Search query to find memories")
     timeline_parser.add_argument("--memory-id", help="Specific memory ID")
-    timeline_parser.add_argument("--limit", type=int, default=10, help="Max memories (default: 10)")
+    timeline_parser.add_argument("--limit", type=int, default=20, help="Max memories (default: 20)")
     timeline_parser.add_argument("--start-date", help="Filter events after this date (ISO format)")
     timeline_parser.add_argument("--end-date", help="Filter events before this date (ISO format)")
     timeline_parser.add_argument("--show-all", action="store_true", help="Show ALL memories chronologically")
@@ -295,6 +307,14 @@ Examples:
 
     # Maintenance command
     subparsers.add_parser("maintenance", help="Run maintenance")
+
+    # Access patterns
+    accessed_parser = subparsers.add_parser("accessed", help="Get most accessed memories with tag cloud")
+    accessed_parser.add_argument("--limit", type=int, default=20, help="Number of memories to show (default: 20)")
+
+    least_accessed_parser = subparsers.add_parser("least-accessed", help="Get least accessed memories - dead weight and buried treasure")
+    least_accessed_parser.add_argument("--limit", type=int, default=20, help="Number of memories to show (default: 20)")
+    least_accessed_parser.add_argument("--min-age-days", type=int, default=7, help="Minimum age in days (default: 7)")
 
     args = parser.parse_args()
 
@@ -375,6 +395,12 @@ Examples:
         elif args.command == "maintenance":
             result = await cli.maintenance()
 
+        elif args.command == "accessed":
+            result = await cli.get_most_accessed(limit=args.limit)
+
+        elif args.command == "least-accessed":
+            result = await cli.get_least_accessed(limit=args.limit, min_age_days=args.min_age_days)
+
         # Output result
         if args.json or args.pretty:
             indent = 2 if args.pretty else None
@@ -402,7 +428,7 @@ Examples:
                     print(f"ACTIVE INTENTIONS ({len(intentions)}):")
                     for i, intention in enumerate(intentions, 1):
                         status_emoji = {"active": "*", "pending": "-", "completed": "✓", "cancelled": "X"}.get(intention.get('status'), '?')
-                        print(f"  {i}. [{intention.get('priority', 0):.2f}] {status_emoji} {intention.get('description', 'No description')[:100]}")
+                        print(f"  {i}. [{intention.get('priority', 0):.2f}] {status_emoji} {intention.get('description', 'No description')}")
                     print()
                 else:
                     print("ACTIVE INTENTIONS: None")
@@ -413,7 +439,7 @@ Examples:
                 if urgent:
                     print(f"URGENT ITEMS ({len(urgent)}):")
                     for item in urgent:
-                        print(f"  [!] {item.get('type', 'unknown')}: {item.get('description', '')[:80]}...")
+                        print(f"  [!] {item.get('type', 'unknown')}: {item.get('description', '')}...")
                     print()
 
                 # Context summary
@@ -426,7 +452,8 @@ Examples:
                     if recent:
                         print(f"  Recent memories: {len(recent)}")
                         for mem in recent[:3]:
-                            print(f"    - [{mem.get('category', 'unknown')}] {mem.get('content', '')[:60]}...")
+                            content = mem.get('content', '').encode('ascii', 'replace').decode('ascii')
+                            print(f"    - [{mem.get('category', 'unknown')}] {content}...")
                     print()
 
                 # Performance
@@ -437,7 +464,8 @@ Examples:
             elif args.command == "store":
                 print(f"[OK] Memory stored successfully")
                 print(f"  ID: {result['memory_id']}")
-                print(f"  Content: {result['content']}")
+                content = result['content'].encode('ascii', 'replace').decode('ascii')
+                print(f"  Content: {content}")
                 if result.get('warnings'):
                     print(f"  Warnings: {', '.join(result['warnings'])}")
 
@@ -456,7 +484,8 @@ Examples:
                     access_count = mem.get('access_count', 0)
 
                     print(f"{i}. [{mem_id}...] {category} (importance: {importance:.2f}, current: {current_imp:.2f})")
-                    print(f"   {content}")
+                    content_safe = content.encode('ascii', 'replace').decode('ascii')
+                    print(f"   {content_safe}")
                     print(f"   Tags: {', '.join(tags) if tags else 'none'}")
                     print(f"   Created: {created_at}, Versions: {version_count}, Accessed: {access_count}x")
 
@@ -520,7 +549,14 @@ Examples:
 
                     # Show abbreviated event list
                     for i, event in enumerate(result.get("events", [])[:20], 1):  # Limit to first 20
-                        print(f"[{i}] v{event['version']} - {event['timestamp'][:19]}")
+                        # Handle datetime objects from SQLite converter
+                        timestamp = event['timestamp']
+                        if hasattr(timestamp, 'isoformat'):
+                            timestamp_str = timestamp.isoformat()[:19]
+                        else:
+                            timestamp_str = str(timestamp)[:19]
+
+                        print(f"[{i}] v{event['version']} - {timestamp_str}")
                         print(f"    {event['category']} | Importance: {event['importance']}")
                         print(f"    {event['content'][:100]}...")
                         if event.get('diff'):
@@ -553,7 +589,8 @@ Examples:
                             print(f"Change Description: {result['last_change_description']}")
                     print("\nCONTENT:")
                     print("-" * 80)
-                    print(result['content'])
+                    content_safe = result['content'].encode('ascii', 'replace').decode('ascii')
+                    print(content_safe)
                     if result.get('metadata'):
                         print("\nMETADATA:")
                         print("-" * 80)
@@ -615,6 +652,72 @@ Examples:
                 print("Maintenance Results:")
                 print("=" * 60)
                 print(json.dumps(result, indent=2, default=str))
+
+            elif args.command == "accessed":
+                print("=" * 80)
+                print("MOST ACCESSED MEMORIES - Behavioral Truth")
+                print("=" * 80)
+                print()
+                print(result.get("interpretation", ""))
+                print()
+
+                memories = result.get("memories", [])
+                print(f"TOP {len(memories)} MEMORIES BY ACCESS COUNT:")
+                print("=" * 80)
+                for i, mem in enumerate(memories, 1):
+                    print(f"\n[{i}] Access Count: {mem['access_count']} | Importance: {mem['importance']}")
+                    print(f"    Category: {mem['category']}")
+                    print(f"    Last Accessed: {mem['last_accessed']}")
+                    print(f"    Content: {mem['content_preview']}")
+
+                print()
+                print("=" * 80)
+                print("TAG CLOUD (Top 30 from most accessed memories):")
+                print("=" * 80)
+                tag_cloud = result.get("tag_cloud", [])
+                if tag_cloud:
+                    # Display in columns
+                    for i in range(0, len(tag_cloud), 3):
+                        row = tag_cloud[i:i+3]
+                        print("  " + " | ".join(f"{t['tag']} ({t['count']})" for t in row))
+                else:
+                    print("  No tags found")
+                print()
+
+            elif args.command == "least-accessed":
+                print("=" * 80)
+                print("LEAST ACCESSED MEMORIES - Dead Weight & Buried Treasure")
+                print("=" * 80)
+                print()
+                print(result.get("interpretation", ""))
+                print()
+                print(f"Minimum age filter: {result.get('min_age_days')} days")
+                print(f"Zero access count: {result.get('zero_access_count')} memories")
+                print()
+
+                memories = result.get("memories", [])
+                print(f"BOTTOM {len(memories)} MEMORIES BY ACCESS COUNT:")
+                print("=" * 80)
+                for i, mem in enumerate(memories, 1):
+                    print(f"\n[{i}] Access Count: {mem['access_count']} | Importance: {mem['importance']} | Age: {mem['age_days']} days")
+                    print(f"    Category: {mem['category']}")
+                    print(f"    Created: {mem['created_at']}")
+                    print(f"    Last Accessed: {mem['last_accessed'] or 'Never'}")
+                    print(f"    Content: {mem['content_preview']}")
+
+                print()
+                print("=" * 80)
+                print("TAG CLOUD (Top 30 from least accessed memories):")
+                print("=" * 80)
+                tag_cloud = result.get("tag_cloud", [])
+                if tag_cloud:
+                    # Display in columns
+                    for i in range(0, len(tag_cloud), 3):
+                        row = tag_cloud[i:i+3]
+                        print("  " + " | ".join(f"{t['tag']} ({t['count']})" for t in row))
+                else:
+                    print("  No tags found")
+                print()
 
     finally:
         await cli.shutdown()

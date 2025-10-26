@@ -110,14 +110,16 @@ BuildAutomata Memory MCP is a Model Context Protocol (MCP) server that provides 
 
 ### MCP Tools Exposed
 
-The server exposes 11 tools (buildautomata_memory_mcp.py:1740):
+The server exposes 13 tools (buildautomata_memory_mcp.py:2321):
 
 **Memory Operations:**
 - `store_memory` - Create new memory with category, importance, tags
 - `update_memory` - Update existing memory (creates new version)
 - `search_memories` - Semantic + full-text search with filters
-- `get_memory_timeline` - View complete version history
+- `get_memory_timeline` - View complete version history with semantic relationships
 - `get_memory_stats` - System statistics and cache info
+- `get_most_accessed_memories` - Reveals behavioral truth (Saint Bernard pattern)
+- `get_least_accessed_memories` - Reveals dead weight and buried treasure
 - `prune_old_memories` - Remove least important memories
 - `run_maintenance` - Database maintenance (VACUUM, ANALYZE)
 
@@ -335,6 +337,7 @@ python interactive_memory.py --json --pretty timeline --query "test"
 
 **Timeline Features:**
 - **Version Diffs**: See actual content changes with similarity scores
+- **Semantic Relationships**: Automatically discovers related memories using learned embeddings (implements The Bitter Lesson)
 - **Burst Detection**: Identifies periods of intensive activity (3+ events in 4 hours)
 - **Gap Analysis**: Detects voids in memory (silence >24 hours)
 - **Cross-References**: Tracks when memories reference each other via UUIDs
