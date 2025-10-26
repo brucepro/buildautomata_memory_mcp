@@ -55,6 +55,19 @@ pip install qdrant-client sentence-transformers
 pip install mcp qdrant-client sentence-transformers
 ```
 
+### Windows-Specific Requirements
+
+**Visual C++ Redistributables:**
+
+If installing `sentence-transformers` on Windows, you'll need Visual C++ Redistributables (PyTorch dependency):
+
+- **Download:** https://aka.ms/vs/17/release/vc_redist.x64.exe
+- **Install and reboot**
+
+**Why needed:** PyTorch (used by sentence-transformers) requires compiled C++ libraries. Without these, you'll get import errors on Windows.
+
+**Skip it?** System will still work - it falls back to SQLite FTS5 keyword search (no semantic search, but functional).
+
 ### Dependency Breakdown
 
 | Package | Required? | Purpose |
@@ -62,6 +75,7 @@ pip install mcp qdrant-client sentence-transformers
 | `mcp` | ✅ Yes | Model Context Protocol SDK |
 | `qdrant-client` | ⚠️ Optional | Vector database for semantic search |
 | `sentence-transformers` | ⚠️ Optional | Generate embeddings for search |
+| `VC++ Redistributables` (Windows) | ⚠️ Optional | Required for sentence-transformers on Windows |
 
 **Without optional packages:** System works with SQLite FTS5 full-text search only (keyword-based, not semantic)
 
@@ -115,6 +129,51 @@ If you don't install Qdrant, the system will:
 - Use SQLite FTS5 for search
 - Be keyword-based instead of semantic
 - Show warning in logs (safe to ignore)
+
+## Step 3.5: Run First-Time Setup (HIGHLY RECOMMENDED)
+
+**Before configuring Claude Desktop, run the setup validation script:**
+
+```bash
+python first_run.py
+```
+
+**This script will:**
+1. Check Python version (3.8+)
+2. Verify pip installation
+3. Check all dependencies (required + optional)
+4. **Pre-download encoder model** (avoids Claude Desktop timeout on first load)
+5. Verify SQLite
+6. Check if Qdrant is running (optional)
+7. Test MCP server initialization
+8. Generate exact config snippet for your system
+
+**Why this matters:**
+
+The sentence-transformers encoder model download can take 2-5 minutes on first run. If this happens during Claude Desktop's first MCP connection attempt, **it will timeout and fail**.
+
+Running `first_run.py` downloads the encoder ahead of time, so Claude Desktop starts instantly.
+
+**Example output:**
+```
+✓ Python 3.11.5 detected
+✓ pip is available
+✓ mcp: Model Context Protocol SDK
+✓ qdrant-client: Qdrant vector database client (optional)
+✓ sentence-transformers: Sentence embeddings (optional)
+⏳ Downloading all-MiniLM-L6-v2 encoder (first time only)...
+✓ Encoder model downloaded successfully
+✓ SQLite version 3.42.0 available
+⚠ Qdrant not running (optional - system works without it)
+✓ MCP server module loaded successfully
+
+✓ REQUIRED: All critical checks passed
+ℹ OPTIONAL: 2/3 optional features available
+
+NEXT STEPS - Configure Claude Desktop
+======================================================================
+...
+```
 
 ## Step 4: Configure Claude Desktop
 
