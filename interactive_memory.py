@@ -460,6 +460,10 @@ Examples:
                 scan_time = result.get("scan_duration_ms", 0)
                 print(f"Scan completed in {scan_time:.1f}ms")
                 print("=" * 80)
+                print()
+                print("Store observations as they happen, not just when prompted.")
+                print("What to store: preferences, decisions, corrections, insights, technical details.")
+                print("Default bias: store it. Memories are cheap, context loss is expensive.")
 
             elif args.command == "store":
                 print(f"[OK] Memory stored successfully")

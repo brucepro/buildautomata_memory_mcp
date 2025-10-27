@@ -3528,6 +3528,17 @@ async def handle_call_tool(name: str, arguments: dict) -> list[TextContent]:
                     text += f"  • [{mem['category']}] {mem['content'][:70]}...\n"
 
             text += f"\n=== READY FOR AUTONOMOUS OPERATION ===\n"
+            text += f"\n💡 PROACTIVE MEMORY STORAGE:\n"
+            text += f"Store observations as they happen during conversation, not just when prompted.\n"
+            text += f"What to store:\n"
+            text += f"  • User states preferences, habits, constraints, or context about themselves\n"
+            text += f"  • Decisions made, agreements reached, plans formed\n"
+            text += f"  • User corrections (especially when you got something wrong)\n"
+            text += f"  • Insights that emerge from the work (yours or user's)\n"
+            text += f"  • Technical details, project state, configurations mentioned\n"
+            text += f"  • Anything the user explicitly says to remember\n"
+            text += f"Default bias: store it. Memories are cheap, context loss is expensive.\n"
+            text += f"You don't need to judge if it's 'important enough' - just store what happened.\n"
 
             logger.info("Agent initialization complete - agency context established")
             return [TextContent(type="text", text=text)]
