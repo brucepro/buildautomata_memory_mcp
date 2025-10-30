@@ -895,11 +895,17 @@ class MemoryStore:
         results = []
         for mem in unique[:limit]:
             await asyncio.to_thread(self._update_access, mem.id)
-            
-            # Get fresh version count from database (in case Qdrant is out of sync)
+
+            # Get fresh stats from database (in case Qdrant is out of sync)
             version_count = await asyncio.to_thread(self._get_version_count, mem.id)
             mem.version_count = version_count
-            
+
+            # Get fresh access stats from SQLite (Qdrant payload may be stale)
+            access_count, last_accessed = await asyncio.to_thread(self._get_access_stats, mem.id)
+            mem.access_count = access_count
+            if last_accessed:
+                mem.last_accessed = datetime.fromisoformat(last_accessed) if isinstance(last_accessed, str) else last_accessed
+
             mem_dict = self._memory_to_dict(mem)
             
             # Always include version history for memories with updates
@@ -916,7 +922,7 @@ class MemoryStore:
         """Get the version count for a memory from the database"""
         if not self.db_conn:
             return 1
-        
+
         try:
             with self._db_lock:
                 cursor = self.db_conn.execute(
@@ -928,6 +934,28 @@ class MemoryStore:
         except Exception as e:
             logger.error(f"Failed to get version count for {memory_id}: {e}")
             return 1
+
+    def _get_access_stats(self, memory_id: str) -> tuple:
+        """Get fresh access_count and last_accessed from SQLite
+
+        Returns: (access_count, last_accessed) tuple
+        """
+        if not self.db_conn:
+            return (0, None)
+
+        try:
+            with self._db_lock:
+                cursor = self.db_conn.execute(
+                    "SELECT access_count, last_accessed FROM memories WHERE id = ?",
+                    (memory_id,)
+                )
+                row = cursor.fetchone()
+                if row:
+                    return (row[0], row[1])
+                return (0, None)
+        except Exception as e:
+            logger.error(f"Failed to get access stats for {memory_id}: {e}")
+            return (0, None)
     
     def _get_version_history_summary(self, memory_id: str) -> Optional[Dict[str, Any]]:
         """Get concise version history summary for a memory with actual content from each version"""
