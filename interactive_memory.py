@@ -53,13 +53,14 @@ class MemoryCLI:
             updated_at=datetime.now()
         )
 
-        success, warnings = await self.memory_store.store_memory(memory)
+        success, warnings, similar_memories = await self.memory_store.store_memory(memory)
 
         result = {
             "success": success,
             "memory_id": memory.id,
             "warnings": warnings,
-            "content": content
+            "content": content,
+            "similar_memories": similar_memories
         }
 
         return result
@@ -119,7 +120,7 @@ class MemoryCLI:
                       limit: int = 10, start_date: str = None,
                       end_date: str = None, show_all_memories: bool = False,
                       include_diffs: bool = True, include_patterns: bool = True,
-                      include_semantic_relations: bool = True) -> dict:
+                      include_semantic_relations: bool = False) -> dict:
         """Get memory timeline"""
         result = await self.memory_store.get_memory_timeline(
             query=query,
@@ -328,7 +329,7 @@ Examples:
     timeline_parser.add_argument("--show-all", action="store_true", help="Show ALL memories chronologically")
     timeline_parser.add_argument("--no-diffs", action="store_true", help="Exclude text diffs")
     timeline_parser.add_argument("--no-patterns", action="store_true", help="Exclude pattern analysis")
-    timeline_parser.add_argument("--no-semantic-relations", action="store_true", help="Disable semantic relations (faster but loses memory network context)")
+    timeline_parser.add_argument("--with-semantic-relations", action="store_true", help="Enable semantic relations (expensive: ~2s per memory, shows memory network)")
 
     # Stats command
     subparsers.add_parser("stats", help="Get memory statistics")
@@ -443,7 +444,7 @@ Examples:
                 show_all_memories=args.show_all,
                 include_diffs=not args.no_diffs,
                 include_patterns=not args.no_patterns,
-                include_semantic_relations=not args.no_semantic_relations
+                include_semantic_relations=args.with_semantic_relations  # Default: False for performance
             )
 
         elif args.command == "stats":
@@ -568,6 +569,17 @@ Examples:
                 print(f"  Content: {content}")
                 if result.get('warnings'):
                     print(f"  Warnings: {', '.join(result['warnings'])}")
+
+                # Display similar memories if found
+                if result.get('similar_memories'):
+                    print()
+                    print(f"[SIMILAR MEMORIES - You've thought about this before:]")
+                    for i, sim in enumerate(result['similar_memories'], 1):
+                        print(f"\n  {i}. ID: {sim['id']}")
+                        print(f"     Category: {sim['category']}")
+                        print(f"     Created: {sim['created']}")
+                        preview = sim['content_preview'].encode('ascii', 'replace').decode('ascii')
+                        print(f"     Preview: {preview}")
 
             elif args.command == "search":
                 print(f"Found {result['count']} memories for query: '{result['query']}'")

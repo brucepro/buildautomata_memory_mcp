@@ -588,9 +588,54 @@ class MemoryStore:
 
     async def store_memory(self, memory: Memory, is_update: bool = False, old_hash: Optional[str] = None) -> Tuple[bool, List[str]]:
         """Store or update a memory with automatic versioning"""
+        import time
         success_backends = []
         errors = []
         skip_version = False
+        similar_memories = []
+
+        # Check for 100% duplicate before storing new memory
+        if not is_update and self.db_conn:
+            content_hash = memory.content_hash()
+            with self._db_lock:
+                cursor = self.db_conn.execute(
+                    "SELECT id FROM memories WHERE content_hash = ?",
+                    (content_hash,)
+                )
+                existing = cursor.fetchone()
+                if existing:
+                    error_msg = f"Duplicate content rejected: matches existing memory {existing[0]}"
+                    logger.warning(error_msg)
+                    return False, [error_msg]
+
+            # Find similar memories (semantic search) - only for new memories
+            similarity_start = time.perf_counter()
+            try:
+                # Use existing search_memories with low limit for speed
+                search_results = await self.search_memories(
+                    query=memory.content,
+                    limit=3,
+                    include_versions=False
+                )
+
+                # Filter out exact matches and format results
+                for result in search_results:
+                    if result['memory_id'] != memory.id:  # Not self
+                        similar_memories.append({
+                            'id': result['memory_id'],
+                            'content_preview': result['content'][:100] + '...' if len(result['content']) > 100 else result['content'],
+                            'category': result.get('category', 'unknown'),
+                            'created': result.get('created_at', 'unknown')
+                        })
+
+                similarity_time = (time.perf_counter() - similarity_start) * 1000
+                logger.info(f"[TIMING] Similarity search found {len(similar_memories)} similar memories in {similarity_time:.2f}ms")
+
+                if similar_memories:
+                    logger.info(f"Similar memories found: {[m['id'] for m in similar_memories]}")
+            except Exception as e:
+                logger.warning(f"Similarity search failed (non-fatal): {e}")
+
         if is_update and old_hash:
             new_hash = memory.content_hash()
             if old_hash == new_hash:
@@ -626,7 +671,13 @@ class MemoryStore:
         if errors:
             logger.warning(f"Store completed with errors for {memory.id}: {errors}")
 
-        return len(success_backends) > 0, success_backends
+        # Return success status, backends, and similar memories
+        result = {
+            'success': len(success_backends) > 0,
+            'backends': success_backends,
+            'similar_memories': similar_memories
+        }
+        return len(success_backends) > 0, success_backends, similar_memories
 
     def _store_in_sqlite(self, memory: Memory, is_update: bool = False, skip_version: bool = False) -> bool:
         """Store in SQLite with automatic versioning"""
@@ -2431,7 +2482,7 @@ class MemoryStore:
         show_all_memories: bool = False,
         include_diffs: bool = True,
         include_patterns: bool = True,
-        include_semantic_relations: bool = True
+        include_semantic_relations: bool = False
     ) -> Dict[str, Any]:
         """
         Get comprehensive memory timeline showing chronological progression,
@@ -3132,13 +3183,23 @@ async def handle_call_tool(name: str, arguments: dict) -> list[TextContent]:
             )
 
             logger.info(f"Storing new memory: {memory.id}")
-            success, backends = await memory_store.store_memory(memory, is_update=False)
+            success, backends, similar_memories = await memory_store.store_memory(memory, is_update=False)
 
             if success:
+                response_text = f"Memory stored successfully.\nID: {memory.id}\nCategory: {memory.category}\nBackends: {', '.join(backends)}"
+
+                if similar_memories:
+                    response_text += f"\n\n[SIMILAR MEMORIES FOUND - You've thought about this before:]\n"
+                    for i, sim in enumerate(similar_memories, 1):
+                        response_text += f"\n{i}. ID: {sim['id']}\n"
+                        response_text += f"   Category: {sim['category']}\n"
+                        response_text += f"   Created: {sim['created']}\n"
+                        response_text += f"   Preview: {sim['content_preview']}\n"
+
                 return [
                     TextContent(
                         type="text",
-                        text=f"Memory stored successfully.\nID: {memory.id}\nCategory: {memory.category}\nBackends: {', '.join(backends)}",
+                        text=response_text,
                     )
                 ]
             else:
@@ -3340,6 +3401,7 @@ async def handle_call_tool(name: str, arguments: dict) -> list[TextContent]:
                 show_all_memories=arguments.get("show_all_memories", False),
                 include_diffs=arguments.get("include_diffs", True),
                 include_patterns=arguments.get("include_patterns", True),
+                include_semantic_relations=arguments.get("include_semantic_relations", False),
             )
 
             if "error" in result:
