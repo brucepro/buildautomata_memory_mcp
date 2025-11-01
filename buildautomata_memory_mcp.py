@@ -221,10 +221,11 @@ class Intention:
 
 
 class MemoryStore:
-    def __init__(self, username: str, agent_name: str):
+    def __init__(self, username: str, agent_name: str, lazy_load: bool = False):
         self.username = username
         self.agent_name = agent_name
         self.collection_name = f"{username}_{agent_name}_memories"
+        self.lazy_load = lazy_load
 
         self.config = {
             "qdrant_host": os.getenv("QDRANT_HOST", "localhost"),
@@ -243,6 +244,8 @@ class MemoryStore:
         self.qdrant_client = None
         self.encoder = None
         self.db_conn = None
+        self._qdrant_initialized = False
+        self._encoder_initialized = False
 
         self._db_lock = threading.RLock()
 
@@ -250,19 +253,38 @@ class MemoryStore:
         self.embedding_cache: LRUCache = LRUCache(maxsize=self.config["cache_maxsize"])
 
         self.error_log: List[Dict[str, Any]] = []
-        
+
         self.last_maintenance: Optional[datetime] = None
 
         self.initialize()
 
     def initialize(self):
         """Initialize all backends with proper error handling"""
+        import time
+        init_start = time.perf_counter()
+
         try:
+            step_start = time.perf_counter()
             self._init_directories()
+            logger.info(f"[TIMING] Directories initialized in {(time.perf_counter() - step_start)*1000:.2f}ms")
+
+            step_start = time.perf_counter()
             self._init_sqlite()
-            self._init_qdrant()
-            self._init_encoder()
-            logger.info("MemoryStore initialized successfully")
+            logger.info(f"[TIMING] SQLite initialized in {(time.perf_counter() - step_start)*1000:.2f}ms")
+
+            if not self.lazy_load:
+                step_start = time.perf_counter()
+                self._init_qdrant()
+                logger.info(f"[TIMING] Qdrant initialized in {(time.perf_counter() - step_start)*1000:.2f}ms")
+
+                step_start = time.perf_counter()
+                self._init_encoder()
+                logger.info(f"[TIMING] Encoder initialized in {(time.perf_counter() - step_start)*1000:.2f}ms")
+            else:
+                logger.info("[LAZY] Deferring Qdrant and encoder initialization until first use")
+
+            total_time = (time.perf_counter() - init_start) * 1000
+            logger.info(f"[TIMING] MemoryStore initialized in {total_time:.2f}ms total")
         except Exception as e:
             logger.error(f"Initialization failed: {e}")
             self._log_error("initialization", e)
@@ -389,6 +411,17 @@ class MemoryStore:
             self._log_error("sqlite_init", e)
             self.db_conn = None
 
+    def _ensure_qdrant(self):
+        """Ensure Qdrant is initialized (lazy loading support)"""
+        if self._qdrant_initialized or not self.lazy_load:
+            return
+
+        import time
+        start = time.perf_counter()
+        self._init_qdrant()
+        self._qdrant_initialized = True
+        logger.info(f"[LAZY] Qdrant loaded on-demand in {(time.perf_counter() - start)*1000:.2f}ms")
+
     def _init_qdrant(self):
         """Initialize Qdrant with retry logic"""
         if not QDRANT_AVAILABLE:
@@ -416,7 +449,7 @@ class MemoryStore:
                 else:
                     logger.info(f"Using existing Qdrant collection: {self.collection_name}")
                 return  # Success
-                
+
             except Exception as e:
                 if attempt == max_retries - 1:
                     logger.error(f"Qdrant initialization failed after {max_retries} attempts: {e}")
@@ -426,6 +459,17 @@ class MemoryStore:
                     logger.warning(f"Qdrant init attempt {attempt + 1} failed, retrying...")
                     import time
                     time.sleep(2 ** attempt)
+
+    def _ensure_encoder(self):
+        """Ensure encoder is initialized (lazy loading support)"""
+        if self._encoder_initialized or not self.lazy_load:
+            return
+
+        import time
+        start = time.perf_counter()
+        self._init_encoder()
+        self._encoder_initialized = True
+        logger.info(f"[LAZY] Encoder loaded on-demand in {(time.perf_counter() - start)*1000:.2f}ms")
 
     def _init_encoder(self):
         """Initialize sentence encoder"""
@@ -468,6 +512,8 @@ class MemoryStore:
 
     def generate_embedding(self, text: str) -> List[float]:
         """Generate embedding with caching"""
+        self._ensure_encoder()
+
         text_hash = hashlib.md5(text.encode()).hexdigest()
 
         if text_hash in self.embedding_cache:
@@ -685,6 +731,8 @@ class MemoryStore:
 
     async def _store_in_qdrant(self, memory: Memory) -> bool:
         """Store in Qdrant"""
+        self._ensure_qdrant()
+
         if not self.qdrant_client:
             return False
 
@@ -733,18 +781,20 @@ class MemoryStore:
                 errors.append(f"SQLite batch: {str(e)}")
 
         # Qdrant batch operation
+        self._ensure_qdrant()
+
         if self.qdrant_client:
             try:
                 embeddings = await asyncio.gather(*[
                     asyncio.to_thread(self.generate_embedding, mem.content)
                     for mem in memories
                 ])
-                
+
                 points = [
                     PointStruct(id=mem.id, vector=emb, payload=mem.to_dict())
                     for mem, emb in zip(memories, embeddings)
                 ]
-                
+
                 await asyncio.to_thread(
                     self.qdrant_client.upsert,
                     collection_name=self.collection_name,
@@ -1013,16 +1063,18 @@ class MemoryStore:
             return None
 
     async def _search_vector(
-        self, 
-        query: str, 
-        limit: int, 
-        category: Optional[str], 
+        self,
+        query: str,
+        limit: int,
+        category: Optional[str],
         min_importance: float,
         created_after: Optional[str] = None,
         created_before: Optional[str] = None,
         updated_after: Optional[str] = None,
         updated_before: Optional[str] = None
     ) -> List[Memory]:
+        self._ensure_qdrant()
+
         if not self.qdrant_client:
             return []
 
@@ -1434,23 +1486,29 @@ class MemoryStore:
 
         try:
             with self._db_lock:
+                # FIX: Use LEFT JOIN to get previous version data in single query
                 cursor = self.db_conn.execute("""
                     SELECT
-                        version_id,
-                        version_number,
-                        content,
-                        category,
-                        importance,
-                        tags,
-                        metadata,
-                        change_type,
-                        change_description,
-                        created_at,
-                        content_hash,
-                        prev_version_id
-                    FROM memory_versions
-                    WHERE memory_id = ?
-                    ORDER BY version_number ASC
+                        curr.version_id,
+                        curr.version_number,
+                        curr.content,
+                        curr.category,
+                        curr.importance,
+                        curr.tags,
+                        curr.metadata,
+                        curr.change_type,
+                        curr.change_description,
+                        curr.created_at,
+                        curr.content_hash,
+                        curr.prev_version_id,
+                        prev.content as prev_content,
+                        prev.category as prev_category,
+                        prev.importance as prev_importance,
+                        prev.tags as prev_tags
+                    FROM memory_versions curr
+                    LEFT JOIN memory_versions prev ON curr.prev_version_id = prev.version_id
+                    WHERE curr.memory_id = ?
+                    ORDER BY curr.version_number ASC
                 """, (mem_id,))
 
                 versions = cursor.fetchall()
@@ -1459,7 +1517,7 @@ class MemoryStore:
                     return []
 
                 events = []
-                prev_content = None
+                prev_content_for_diff = None
 
                 for row in versions:
                     event = {
@@ -1476,39 +1534,31 @@ class MemoryStore:
                     }
 
                     # Add text diff if requested and there's a previous version
-                    if include_diffs and prev_content:
-                        diff_info = self._compute_text_diff(prev_content, row["content"])
+                    if include_diffs and prev_content_for_diff:
+                        diff_info = self._compute_text_diff(prev_content_for_diff, row["content"])
                         if diff_info.get("changed"):
                             event["diff"] = diff_info
 
-                    # Field-level changes
-                    if row["prev_version_id"]:
-                        prev_cursor = self.db_conn.execute("""
-                            SELECT content, category, importance, tags
-                            FROM memory_versions
-                            WHERE version_id = ?
-                        """, (row["prev_version_id"],))
-                        prev = prev_cursor.fetchone()
+                    # Field-level changes (now from JOIN result, no extra query)
+                    if row["prev_version_id"] and row["prev_category"]:
+                        field_changes = []
+                        if row["prev_category"] != row["category"]:
+                            field_changes.append(f"category: {row['prev_category']} → {row['category']}")
+                        if row["prev_importance"] != row["importance"]:
+                            field_changes.append(f"importance: {row['prev_importance']} → {row['importance']}")
 
-                        if prev:
-                            field_changes = []
-                            if prev["category"] != row["category"]:
-                                field_changes.append(f"category: {prev['category']} → {row['category']}")
-                            if prev["importance"] != row["importance"]:
-                                field_changes.append(f"importance: {prev['importance']} → {row['importance']}")
+                        prev_tags = set(json.loads(row["prev_tags"]) if row["prev_tags"] else [])
+                        curr_tags = set(json.loads(row["tags"]) if row["tags"] else [])
+                        if prev_tags != curr_tags:
+                            added_tags = curr_tags - prev_tags
+                            removed_tags = prev_tags - curr_tags
+                            if added_tags:
+                                field_changes.append(f"tags added: {', '.join(added_tags)}")
+                            if removed_tags:
+                                field_changes.append(f"tags removed: {', '.join(removed_tags)}")
 
-                            prev_tags = set(json.loads(prev["tags"]) if prev["tags"] else [])
-                            curr_tags = set(json.loads(row["tags"]) if row["tags"] else [])
-                            if prev_tags != curr_tags:
-                                added_tags = curr_tags - prev_tags
-                                removed_tags = prev_tags - curr_tags
-                                if added_tags:
-                                    field_changes.append(f"tags added: {', '.join(added_tags)}")
-                                if removed_tags:
-                                    field_changes.append(f"tags removed: {', '.join(removed_tags)}")
-
-                            if field_changes:
-                                event["field_changes"] = field_changes
+                        if field_changes:
+                            event["field_changes"] = field_changes
 
                     # Extract cross-references
                     references = self._extract_memory_references(row["content"], all_memory_ids)
@@ -1517,7 +1567,7 @@ class MemoryStore:
                         event["references_count"] = len(references)
 
                     events.append(event)
-                    prev_content = row["content"]
+                    prev_content_for_diff = row["content"]
 
                 return events
 
@@ -2380,26 +2430,40 @@ class MemoryStore:
         end_date: str = None,
         show_all_memories: bool = False,
         include_diffs: bool = True,
-        include_patterns: bool = True
+        include_patterns: bool = True,
+        include_semantic_relations: bool = True
     ) -> Dict[str, Any]:
         """
         Get comprehensive memory timeline showing chronological progression,
         evolution, bursts, gaps, and cross-references.
 
         This creates a "biographical narrative" of memory formation and revision.
+
+        Args:
+            include_semantic_relations: If True (default), find semantically related memories
+                                        to expose memory network. Expensive but valuable for AI context.
         """
         if not self.db_conn:
             return {"error": "Database not available"}
 
         try:
+            import time
+            timeline_start = time.perf_counter()
+
             # Collect all events chronologically
             all_events = []
             target_memories = []
 
             if show_all_memories:
-                # Get ALL memories for full timeline
+                # Get ALL memories for full timeline (cap at 100 to prevent explosion)
+                limit_for_all = min(limit, 100) if limit else 100
+                logger.info(f"[TIMELINE] show_all_memories requested, limiting to {limit_for_all}")
                 with self._db_lock:
-                    cursor = self.db_conn.execute("SELECT id FROM memories")
+                    cursor = self.db_conn.execute("""
+                        SELECT id FROM memories
+                        ORDER BY updated_at DESC
+                        LIMIT ?
+                    """, (limit_for_all,))
                     target_memories = [row[0] for row in cursor.fetchall()]
             elif memory_id:
                 target_memories = [memory_id]
@@ -2416,6 +2480,8 @@ class MemoryStore:
                     """, (limit,))
                     target_memories = [row[0] for row in cursor.fetchall()]
 
+            logger.info(f"[TIMELINE] Tracking {len(target_memories)} memories")
+
             if not target_memories:
                 return {"error": "No memories found"}
 
@@ -2425,6 +2491,7 @@ class MemoryStore:
                 all_memory_ids = {row[0] for row in cursor.fetchall()}
 
             # Collect all version events
+            step_start = time.perf_counter()
             for mem_id in target_memories:
                 versions = await asyncio.to_thread(
                     self._get_memory_versions_detailed,
@@ -2433,6 +2500,7 @@ class MemoryStore:
                     include_diffs
                 )
                 all_events.extend(versions)
+            logger.info(f"[TIMELINE] Fetched {len(all_events)} version events in {(time.perf_counter() - step_start)*1000:.2f}ms")
 
             if not all_events:
                 return {"error": "No version history found"}
@@ -2440,34 +2508,45 @@ class MemoryStore:
             # Sort chronologically
             all_events.sort(key=lambda e: e['timestamp'])
 
-            # Enrich with semantically related memories (Bitter Lesson: use learned search)
-            # Group events by memory_id to avoid duplicate searches
-            unique_memories = {}
-            for event in all_events:
-                mem_id = event["memory_id"]
-                if mem_id not in unique_memories:
-                    unique_memories[mem_id] = event["content"]
+            # Enrich with semantically related memories (EXPENSIVE - only if requested)
+            if include_semantic_relations:
+                step_start = time.perf_counter()
+                # Group events by memory_id to avoid duplicate searches
+                unique_memories = {}
+                for event in all_events:
+                    mem_id = event["memory_id"]
+                    if mem_id not in unique_memories:
+                        unique_memories[mem_id] = event["content"]
 
-            # Find related memories for each unique memory
-            related_map = {}
-            for mem_id, content in unique_memories.items():
-                related = await self._find_related_memories_semantic(mem_id, content, limit=5)
-                if related:
-                    related_map[mem_id] = related
+                logger.info(f"[TIMELINE] Finding semantic relations for {len(unique_memories)} unique memories...")
+                # Find related memories for each unique memory
+                related_map = {}
+                for mem_id, content in unique_memories.items():
+                    related = await self._find_related_memories_semantic(mem_id, content, limit=5)
+                    if related:
+                        related_map[mem_id] = related
 
-            # Add related memories to events
-            for event in all_events:
-                mem_id = event["memory_id"]
-                if mem_id in related_map:
-                    event["related_memories"] = related_map[mem_id]
+                # Add related memories to events
+                for event in all_events:
+                    mem_id = event["memory_id"]
+                    if mem_id in related_map:
+                        event["related_memories"] = related_map[mem_id]
+
+                logger.info(f"[TIMELINE] Semantic relations computed in {(time.perf_counter() - step_start)*1000:.2f}ms")
+            else:
+                logger.info("[TIMELINE] Skipping semantic relations (not requested)")
 
             # Detect patterns if requested
             patterns = {}
             if include_patterns:
+                step_start = time.perf_counter()
                 patterns = self._detect_temporal_patterns(all_events)
+                logger.info(f"[TIMELINE] Patterns detected in {(time.perf_counter() - step_start)*1000:.2f}ms")
 
             # Build memory relationship graph (explicit UUID references)
+            step_start = time.perf_counter()
             memory_relationships = self._build_relationship_graph(all_events)
+            logger.info(f"[TIMELINE] Relationship graph built in {(time.perf_counter() - step_start)*1000:.2f}ms")
 
             # Apply date filtering if specified
             if start_date or end_date:
@@ -2481,6 +2560,9 @@ class MemoryStore:
                     filtered_events.append(event)
                 all_events = filtered_events
 
+            total_time = (time.perf_counter() - timeline_start) * 1000
+            logger.info(f"[TIMELINE] Complete in {total_time:.2f}ms total")
+
             return {
                 "timeline_type": "comprehensive",
                 "total_events": len(all_events),
@@ -2488,7 +2570,8 @@ class MemoryStore:
                 "temporal_patterns": patterns,
                 "memory_relationships": memory_relationships,
                 "events": all_events,
-                "narrative_arc": self._generate_narrative_summary(all_events, patterns)
+                "narrative_arc": self._generate_narrative_summary(all_events, patterns),
+                "performance_ms": round(total_time, 2)
             }
 
         except Exception as e:

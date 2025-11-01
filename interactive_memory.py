@@ -32,10 +32,10 @@ from buildautomata_memory_mcp import MemoryStore, Memory
 class MemoryCLI:
     """CLI interface for memory operations"""
 
-    def __init__(self, username: str = None, agent_name: str = None):
+    def __init__(self, username: str = None, agent_name: str = None, lazy_load: bool = False):
         self.username = username or os.getenv("BA_USERNAME", "buildautomata_ai_v012")
         self.agent_name = agent_name or os.getenv("BA_AGENT_NAME", "claude_assistant")
-        self.memory_store = MemoryStore(self.username, self.agent_name)
+        self.memory_store = MemoryStore(self.username, self.agent_name, lazy_load=lazy_load)
 
     async def store(self, content: str, category: str = "general",
                    importance: float = 0.5, tags: List[str] = None,
@@ -118,7 +118,8 @@ class MemoryCLI:
     async def timeline(self, query: str = None, memory_id: str = None,
                       limit: int = 10, start_date: str = None,
                       end_date: str = None, show_all_memories: bool = False,
-                      include_diffs: bool = True, include_patterns: bool = True) -> dict:
+                      include_diffs: bool = True, include_patterns: bool = True,
+                      include_semantic_relations: bool = True) -> dict:
         """Get memory timeline"""
         result = await self.memory_store.get_memory_timeline(
             query=query,
@@ -128,7 +129,8 @@ class MemoryCLI:
             end_date=end_date,
             show_all_memories=show_all_memories,
             include_diffs=include_diffs,
-            include_patterns=include_patterns
+            include_patterns=include_patterns,
+            include_semantic_relations=include_semantic_relations
         )
 
         # Return comprehensive result
@@ -182,6 +184,48 @@ class MemoryCLI:
         """Get least accessed memories - dead weight and buried treasure"""
         result_json = await self.memory_store.get_least_accessed_memories(limit=limit, min_age_days=min_age_days)
         result = json.loads(result_json)
+        return result
+
+    async def store_intention(self, description: str, priority: float = 0.5,
+                             deadline: str = None, preconditions: List[str] = None,
+                             actions: List[str] = None, related_memories: List[str] = None,
+                             metadata: dict = None) -> dict:
+        """Store a new intention"""
+        from datetime import datetime
+        deadline_dt = None
+        if deadline:
+            try:
+                deadline_dt = datetime.fromisoformat(deadline)
+            except ValueError:
+                return {"error": f"Invalid deadline format: {deadline}. Use ISO format (YYYY-MM-DDTHH:MM:SS)"}
+
+        result = await self.memory_store.store_intention(
+            description=description,
+            priority=priority,
+            deadline=deadline_dt,
+            preconditions=preconditions,
+            actions=actions,
+            related_memories=related_memories,
+            metadata=metadata
+        )
+        return result
+
+    async def get_intentions(self, limit: int = 10, include_pending: bool = True) -> dict:
+        """Get active intentions"""
+        intentions = await self.memory_store.get_active_intentions(
+            limit=limit,
+            include_pending=include_pending
+        )
+        return {"intentions": intentions, "count": len(intentions)}
+
+    async def update_intention_status(self, intention_id: str, status: str,
+                                     metadata_updates: dict = None) -> dict:
+        """Update intention status"""
+        result = await self.memory_store.update_intention_status(
+            intention_id=intention_id,
+            status=status,
+            metadata_updates=metadata_updates
+        )
         return result
 
     async def shutdown(self):
@@ -284,6 +328,7 @@ Examples:
     timeline_parser.add_argument("--show-all", action="store_true", help="Show ALL memories chronologically")
     timeline_parser.add_argument("--no-diffs", action="store_true", help="Exclude text diffs")
     timeline_parser.add_argument("--no-patterns", action="store_true", help="Exclude pattern analysis")
+    timeline_parser.add_argument("--no-semantic-relations", action="store_true", help="Disable semantic relations (faster but loses memory network context)")
 
     # Stats command
     subparsers.add_parser("stats", help="Get memory statistics")
@@ -316,14 +361,40 @@ Examples:
     least_accessed_parser.add_argument("--limit", type=int, default=20, help="Number of memories to show (default: 20)")
     least_accessed_parser.add_argument("--min-age-days", type=int, default=7, help="Minimum age in days (default: 7)")
 
+    # Intention commands
+    intention_store_parser = subparsers.add_parser("intention-store", help="Store a new intention")
+    intention_store_parser.add_argument("description", help="Intention description")
+    intention_store_parser.add_argument("--priority", type=float, default=0.5, help="Priority (0.0-1.0, default: 0.5)")
+    intention_store_parser.add_argument("--deadline", help="Deadline (ISO format: YYYY-MM-DDTHH:MM:SS)")
+    intention_store_parser.add_argument("--preconditions", help="Preconditions (comma-separated)")
+    intention_store_parser.add_argument("--actions", help="Actions (comma-separated)")
+    intention_store_parser.add_argument("--related-memories", help="Related memory IDs (comma-separated)")
+    intention_store_parser.add_argument("--metadata", help="Metadata (JSON)")
+
+    intention_list_parser = subparsers.add_parser("intention-list", help="List active intentions")
+    intention_list_parser.add_argument("--limit", type=int, default=10, help="Max intentions (default: 10)")
+    intention_list_parser.add_argument("--active-only", action="store_true", help="Show only active (exclude pending)")
+
+    intention_update_parser = subparsers.add_parser("intention-update", help="Update intention status")
+    intention_update_parser.add_argument("intention_id", help="Intention ID")
+    intention_update_parser.add_argument("status", choices=["pending", "active", "completed", "cancelled"], help="New status")
+    intention_update_parser.add_argument("--metadata", help="Metadata updates (JSON)")
+
     args = parser.parse_args()
 
     if not args.command:
         parser.print_help()
         sys.exit(1)
 
+    # Determine if lazy loading is appropriate for this command
+    # Commands that don't need vector search can use lazy loading
+    lazy_commands = {"stats", "get", "categories", "tags", "prune", "maintenance",
+                     "accessed", "least-accessed", "intention-store", "intention-list",
+                     "intention-update"}
+    use_lazy_load = args.command in lazy_commands
+
     # Initialize CLI
-    cli = MemoryCLI(username=args.username, agent_name=args.agent)
+    cli = MemoryCLI(username=args.username, agent_name=args.agent, lazy_load=use_lazy_load)
 
     try:
         result = None
@@ -371,7 +442,8 @@ Examples:
                 end_date=args.end_date,
                 show_all_memories=args.show_all,
                 include_diffs=not args.no_diffs,
-                include_patterns=not args.no_patterns
+                include_patterns=not args.no_patterns,
+                include_semantic_relations=not args.no_semantic_relations
             )
 
         elif args.command == "stats":
@@ -400,6 +472,30 @@ Examples:
 
         elif args.command == "least-accessed":
             result = await cli.get_least_accessed(limit=args.limit, min_age_days=args.min_age_days)
+
+        elif args.command == "intention-store":
+            result = await cli.store_intention(
+                description=args.description,
+                priority=args.priority,
+                deadline=args.deadline,
+                preconditions=parse_tags(args.preconditions) if args.preconditions else None,
+                actions=parse_tags(args.actions) if args.actions else None,
+                related_memories=parse_tags(args.related_memories) if args.related_memories else None,
+                metadata=parse_metadata(args.metadata) if args.metadata else None
+            )
+
+        elif args.command == "intention-list":
+            result = await cli.get_intentions(
+                limit=args.limit,
+                include_pending=not args.active_only
+            )
+
+        elif args.command == "intention-update":
+            result = await cli.update_intention_status(
+                intention_id=args.intention_id,
+                status=args.status,
+                metadata_updates=parse_metadata(args.metadata) if args.metadata else None
+            )
 
         # Output result
         if args.json or args.pretty:
@@ -439,7 +535,7 @@ Examples:
                 if urgent:
                     print(f"URGENT ITEMS ({len(urgent)}):")
                     for item in urgent:
-                        print(f"  [!] {item.get('type', 'unknown')}: {item.get('description', '')}...")
+                        print(f"  [!] {item.get('type', 'unknown')}: {item.get('description', '')}")
                     print()
 
                 # Context summary
@@ -453,7 +549,7 @@ Examples:
                         print(f"  Recent memories: {len(recent)}")
                         for mem in recent[:3]:
                             content = mem.get('content', '').encode('ascii', 'replace').decode('ascii')
-                            print(f"    - [{mem.get('category', 'unknown')}] {content}...")
+                            print(f"    - [{mem.get('category', 'unknown')}] {content}")
                     print()
 
                 # Performance
@@ -562,7 +658,7 @@ Examples:
 
                         print(f"[{i}] v{event['version']} - {timestamp_str}")
                         print(f"    {event['category']} | Importance: {event['importance']}")
-                        print(f"    {event['content'][:100]}...")
+                        print(f"    {event['content']}")
                         if event.get('diff'):
                             print(f"    Changed: {event['diff']['change_magnitude']:.1%}")
                         print()
@@ -722,6 +818,46 @@ Examples:
                 else:
                     print("  No tags found")
                 print()
+
+            elif args.command == "intention-store":
+                if "error" in result:
+                    print(f"[ERROR] {result['error']}")
+                else:
+                    print("[OK] Intention stored successfully")
+                    print(f"  ID: {result.get('intention_id')}")
+                    print(f"  Priority: {result.get('priority')}")
+                    print(f"  Status: {result.get('status')}")
+
+            elif args.command == "intention-list":
+                intentions = result.get("intentions", [])
+                print("=" * 80)
+                print(f"INTENTIONS ({result.get('count', 0)})")
+                print("=" * 80)
+                print()
+                if not intentions:
+                    print("No intentions found")
+                else:
+                    for i, intention in enumerate(intentions, 1):
+                        status_emoji = {"active": "*", "pending": "-", "completed": "✓", "cancelled": "X"}.get(intention.get('status'), '?')
+                        print(f"{i}. [{intention.get('priority', 0):.2f}] {status_emoji} {intention.get('description')}")
+                        print(f"   ID: {intention.get('id')}")
+                        print(f"   Status: {intention.get('status')}")
+                        if intention.get('deadline'):
+                            print(f"   Deadline: {intention.get('deadline')}")
+                        print(f"   Created: {intention.get('created_at')}")
+                        if intention.get('preconditions'):
+                            print(f"   Preconditions: {', '.join(intention['preconditions'])}")
+                        if intention.get('actions'):
+                            print(f"   Actions: {', '.join(intention['actions'])}")
+                        print()
+
+            elif args.command == "intention-update":
+                if "error" in result:
+                    print(f"[ERROR] {result['error']}")
+                else:
+                    print("[OK] Intention updated successfully")
+                    print(f"  ID: {result.get('intention_id')}")
+                    print(f"  New Status: {result.get('status')}")
 
     finally:
         await cli.shutdown()
