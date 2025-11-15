@@ -39,7 +39,8 @@ class MemoryCLI:
 
     async def store(self, content: str, category: str = "general",
                    importance: float = 0.5, tags: List[str] = None,
-                   metadata: dict = None) -> dict:
+                   metadata: dict = None, memory_type: str = "episodic",
+                   session_id: str = None, task_context: str = None) -> dict:
         """Store a new memory"""
         import uuid as uuid_lib
         memory = Memory(
@@ -50,17 +51,20 @@ class MemoryCLI:
             tags=tags or [],
             metadata=metadata or {},
             created_at=datetime.now(),
-            updated_at=datetime.now()
+            updated_at=datetime.now(),
+            memory_type=memory_type,
+            session_id=session_id,
+            task_context=task_context
         )
 
-        success, warnings, similar_memories = await self.memory_store.store_memory(memory)
+        store_result = await self.memory_store.store_memory(memory)
 
         result = {
-            "success": success,
+            "success": store_result["success"],
             "memory_id": memory.id,
-            "warnings": warnings,
+            "warnings": store_result.get("backends", []),
             "content": content,
-            "similar_memories": similar_memories
+            "similar_memories": store_result.get("similar_memories", [])
         }
 
         return result
@@ -68,7 +72,8 @@ class MemoryCLI:
     async def search(self, query: str, limit: int = 5, category: str = None,
                     min_importance: float = 0.0, created_after: str = None,
                     created_before: str = None, updated_after: str = None,
-                    updated_before: str = None) -> dict:
+                    updated_before: str = None, memory_type: str = None,
+                    session_id: str = None) -> dict:
         """Search for memories"""
         results = await self.memory_store.search_memories(
             query=query,
@@ -78,7 +83,9 @@ class MemoryCLI:
             created_after=created_after,
             created_before=created_before,
             updated_after=updated_after,
-            updated_before=updated_before
+            updated_before=updated_before,
+            memory_type=memory_type,
+            session_id=session_id
         )
 
         # Results are already dictionaries from the store
@@ -104,16 +111,16 @@ class MemoryCLI:
         if metadata is not None:
             updates["metadata"] = metadata
 
-        success, changes, warnings = await self.memory_store.update_memory(
+        update_result = await self.memory_store.update_memory(
             memory_id=memory_id,
             **updates
         )
 
         return {
-            "success": success,
+            "success": update_result["success"],
             "memory_id": memory_id,
-            "changes": changes,
-            "warnings": warnings
+            "changes": update_result.get("message", ""),
+            "warnings": update_result.get("backends", [])
         }
 
     async def timeline(self, query: str = None, memory_id: str = None,
@@ -229,6 +236,41 @@ class MemoryCLI:
         )
         return result
 
+    async def get_session_memories(self, session_id: str = None,
+                                   start_date: str = None, end_date: str = None,
+                                   task_context: str = None, limit: int = 100) -> dict:
+        """Get memories from a work session or time period"""
+        date_range = None
+        if start_date and end_date:
+            date_range = (start_date, end_date)
+
+        memories = await self.memory_store.get_session_memories(
+            session_id=session_id,
+            date_range=date_range,
+            task_context=task_context,
+            limit=limit
+        )
+        return {
+            "session_id": session_id,
+            "date_range": date_range,
+            "task_context": task_context,
+            "count": len(memories),
+            "memories": memories
+        }
+
+    async def consolidate_memories(self, memory_ids: List[str],
+                                   consolidation_type: str = "summarize",
+                                   target_length: int = 500,
+                                   new_memory_type: str = "semantic") -> dict:
+        """Consolidate multiple episodic memories into semantic memory"""
+        result = await self.memory_store.consolidate_memories(
+            memory_ids=memory_ids,
+            consolidation_type=consolidation_type,
+            target_length=target_length,
+            new_memory_type=new_memory_type
+        )
+        return result
+
     async def shutdown(self):
         """Shutdown the store"""
         await self.memory_store.shutdown()
@@ -250,6 +292,70 @@ def parse_metadata(metadata_str: str) -> dict:
     except json.JSONDecodeError as e:
         print(f"Error parsing metadata JSON: {e}", file=sys.stderr)
         return {}
+
+
+def format_compact_search(result: dict) -> str:
+    """Compact AI-optimized search output"""
+    lines = [f"SEARCH_RESULTS count={result['count']} query={result['query']}"]
+    for mem in result['results']:
+        mem_id = mem.get('memory_id', mem.get('id', 'unknown'))
+        category = mem.get('category', 'general')
+        importance = mem.get('importance', 0.0)
+        current_imp = mem.get('current_importance', importance)
+        content = mem.get('content', '').replace('\n', ' ').encode('ascii', 'replace').decode('ascii')
+        tags = ','.join(mem.get('tags', []))
+        created = mem.get('created_at', '')
+        versions = mem.get('version_count', 1)
+        accessed = mem.get('access_count', 0)
+        lines.append(f"MEMORY id={mem_id} category={category} importance={importance:.2f} current={current_imp:.2f} versions={versions} accessed={accessed} created={created}")
+        lines.append(f"CONTENT {content}")
+        if tags:
+            lines.append(f"TAGS {tags}")
+    return '\n'.join(lines)
+
+
+def format_compact_init(result: dict) -> str:
+    """Compact AI-optimized init output"""
+    lines = ["INIT"]
+
+    continuity = result.get("continuity_check", {})
+    if continuity:
+        lines.append(f"CONTINUITY gap_hours={continuity.get('time_gap_hours', 0):.1f} new_session={continuity.get('is_new_session', False)}")
+
+    intentions = result.get("active_intentions", [])
+    if intentions:
+        lines.append(f"INTENTIONS count={len(intentions)}")
+        for intention in intentions:
+            desc = intention.get('description', '').encode('ascii', 'replace').decode('ascii')
+            lines.append(f"INTENTION priority={intention.get('priority', 0):.2f} status={intention.get('status', 'unknown')} description={desc}")
+
+    urgent = result.get("urgent_items", [])
+    if urgent:
+        lines.append(f"URGENT count={len(urgent)}")
+        for item in urgent:
+            desc = item.get('description', '').encode('ascii', 'replace').decode('ascii')
+            lines.append(f"URGENT_ITEM type={item.get('type', 'unknown')} description={desc}")
+
+    context = result.get("context_summary", {})
+    if context:
+        recent = context.get("recent_memories", [])
+        if recent:
+            lines.append(f"RECENT_MEMORIES count={len(recent)}")
+            for mem in recent:
+                content = mem.get('content', '').replace('\n', ' ').encode('ascii', 'replace').decode('ascii')
+                lines.append(f"RECENT category={mem.get('category', 'unknown')} content={content}")
+
+    return '\n'.join(lines)
+
+
+def format_compact_get(result: dict) -> str:
+    """Compact AI-optimized get output"""
+    lines = [f"MEMORY id={result['memory_id']}"]
+    lines.append(f"META category={result['category']} importance={result['importance']} tags={','.join(result.get('tags', []))} versions={result['version_count']} accessed={result['access_count']}")
+    lines.append(f"TIMESTAMPS created={result['created_at']} updated={result['updated_at']} last_accessed={result.get('last_accessed', 'never')}")
+    content = result['content'].replace('\n', ' ')
+    lines.append(f"CONTENT {content}")
+    return '\n'.join(lines)
 
 
 async def main():
@@ -285,6 +391,7 @@ Examples:
     parser.add_argument("--agent", help="Agent name (overrides BA_AGENT_NAME env var)")
     parser.add_argument("--json", action="store_true", help="Output as JSON")
     parser.add_argument("--pretty", action="store_true", help="Pretty print JSON output")
+    parser.add_argument("--human", action="store_true", help="Human-readable verbose output (default: AI-optimized compact)")
 
     subparsers = parser.add_subparsers(dest="command", help="Command to execute")
 
@@ -298,6 +405,9 @@ Examples:
     store_parser.add_argument("--importance", type=float, default=0.5, help="Importance 0.0-1.0 (default: 0.5)")
     store_parser.add_argument("--tags", help="Comma-separated tags")
     store_parser.add_argument("--metadata", help="JSON metadata")
+    store_parser.add_argument("--memory-type", default="episodic", choices=["episodic", "semantic", "working"], help="Memory type (default: episodic)")
+    store_parser.add_argument("--session-id", help="Session ID for grouping memories")
+    store_parser.add_argument("--task-context", help="Task context description")
 
     # Search command
     search_parser = subparsers.add_parser("search", help="Search memories")
@@ -309,6 +419,8 @@ Examples:
     search_parser.add_argument("--created-before", help="Filter created before (ISO format)")
     search_parser.add_argument("--updated-after", help="Filter updated after (ISO format)")
     search_parser.add_argument("--updated-before", help="Filter updated before (ISO format)")
+    search_parser.add_argument("--memory-type", choices=["episodic", "semantic", "working"], help="Filter by memory type")
+    search_parser.add_argument("--session-id", help="Filter by session ID")
 
     # Update command
     update_parser = subparsers.add_parser("update", help="Update a memory")
@@ -381,6 +493,21 @@ Examples:
     intention_update_parser.add_argument("status", choices=["pending", "active", "completed", "cancelled"], help="New status")
     intention_update_parser.add_argument("--metadata", help="Metadata updates (JSON)")
 
+    # Session memories command
+    session_parser = subparsers.add_parser("get-session", help="Get memories from a work session or time period")
+    session_parser.add_argument("--session-id", help="Session ID to retrieve")
+    session_parser.add_argument("--start-date", help="Start date (ISO format)")
+    session_parser.add_argument("--end-date", help="End date (ISO format)")
+    session_parser.add_argument("--task-context", help="Task context filter")
+    session_parser.add_argument("--limit", type=int, default=100, help="Max memories (default: 100)")
+
+    # Consolidate memories command
+    consolidate_parser = subparsers.add_parser("consolidate", help="Consolidate episodic memories into semantic memory")
+    consolidate_parser.add_argument("memory_ids", help="Comma-separated memory IDs to consolidate")
+    consolidate_parser.add_argument("--type", dest="consolidation_type", default="summarize", choices=["summarize", "synthesize", "compress"], help="Consolidation type (default: summarize)")
+    consolidate_parser.add_argument("--target-length", type=int, default=500, help="Target length in characters (default: 500)")
+    consolidate_parser.add_argument("--new-type", default="semantic", choices=["episodic", "semantic", "working"], help="New memory type (default: semantic)")
+
     args = parser.parse_args()
 
     if not args.command:
@@ -391,7 +518,7 @@ Examples:
     # Commands that don't need vector search can use lazy loading
     lazy_commands = {"stats", "get", "categories", "tags", "prune", "maintenance",
                      "accessed", "least-accessed", "intention-store", "intention-list",
-                     "intention-update"}
+                     "intention-update", "get-session", "consolidate"}
     use_lazy_load = args.command in lazy_commands
 
     # Initialize CLI
@@ -409,7 +536,10 @@ Examples:
                 category=args.category,
                 importance=args.importance,
                 tags=parse_tags(args.tags),
-                metadata=parse_metadata(args.metadata)
+                metadata=parse_metadata(args.metadata),
+                memory_type=args.memory_type,
+                session_id=args.session_id,
+                task_context=args.task_context
             )
 
         elif args.command == "search":
@@ -421,7 +551,9 @@ Examples:
                 created_after=args.created_after,
                 created_before=args.created_before,
                 updated_after=args.updated_after,
-                updated_before=args.updated_before
+                updated_before=args.updated_before,
+                memory_type=args.memory_type,
+                session_id=args.session_id
             )
 
         elif args.command == "update":
@@ -498,12 +630,31 @@ Examples:
                 metadata_updates=parse_metadata(args.metadata) if args.metadata else None
             )
 
+        elif args.command == "get-session":
+            result = await cli.get_session_memories(
+                session_id=args.session_id,
+                start_date=args.start_date,
+                end_date=args.end_date,
+                task_context=args.task_context,
+                limit=args.limit
+            )
+
+        elif args.command == "consolidate":
+            memory_ids = [id.strip() for id in args.memory_ids.split(",")]
+            result = await cli.consolidate_memories(
+                memory_ids=memory_ids,
+                consolidation_type=args.consolidation_type,
+                target_length=args.target_length,
+                new_memory_type=args.new_type
+            )
+
         # Output result
         if args.json or args.pretty:
+            # JSON output
             indent = 2 if args.pretty else None
             print(json.dumps(result, indent=indent, default=str))
-        else:
-            # Human-readable output
+        elif args.human:
+            # Human-readable verbose output
             if args.command == "init":
                 print("=" * 80)
                 print("AGENT INITIALIZATION")
@@ -594,12 +745,20 @@ Examples:
                     created_at = mem.get('created_at', '')
                     version_count = mem.get('version_count', 1)
                     access_count = mem.get('access_count', 0)
+                    related_memories = mem.get('related_memories', [])
 
-                    print(f"{i}. [{mem_id}...] {category} (importance: {importance:.2f}, current: {current_imp:.2f})")
+                    print(f"{i}. [{mem_id}] {category} (importance: {importance:.2f}, current: {current_imp:.2f})")
                     content_safe = content.encode('ascii', 'replace').decode('ascii')
                     print(f"   {content_safe}")
                     print(f"   Tags: {', '.join(tags) if tags else 'none'}")
                     print(f"   Created: {created_at}, Versions: {version_count}, Accessed: {access_count}x")
+                    if related_memories:
+                        print(f"   Related ({len(related_memories)} memories):")
+                        for j, rel in enumerate(related_memories[:3], 1):  # Show first 3
+                            rel_preview = rel.get('content_preview', '')[:80]
+                            rel_cat = rel.get('category', 'unknown')
+                            rel_imp = rel.get('importance', 0.0)
+                            print(f"      {j}. [{rel_cat}] {rel_preview} (imp: {rel_imp:.2f})")
 
                     # Show version history summary if available
                     if mem.get('version_history'):
@@ -741,6 +900,11 @@ Examples:
             elif args.command == "stats":
                 print("Memory System Statistics:")
                 print("=" * 60)
+                if result.get('version'):
+                    print(f"Version: {result['version']}")
+                if result.get('fixes'):
+                    print(f"Fixes: {', '.join(result['fixes'])}")
+                    print("-" * 60)
                 print(f"Total memories: {result.get('total_memories', 0)}")
                 print(f"Total versions: {result.get('total_versions', 0)}")
                 print(f"Cache size: {result.get('cache_size', 0)}")
@@ -870,6 +1034,85 @@ Examples:
                     print("[OK] Intention updated successfully")
                     print(f"  ID: {result.get('intention_id')}")
                     print(f"  New Status: {result.get('status')}")
+
+            elif args.command == "get-session":
+                print("=" * 80)
+                print("SESSION MEMORIES")
+                print("=" * 80)
+                if result.get('session_id'):
+                    print(f"Session ID: {result['session_id']}")
+                if result.get('date_range'):
+                    print(f"Date Range: {result['date_range'][0]} to {result['date_range'][1]}")
+                if result.get('task_context'):
+                    print(f"Task Context: {result['task_context']}")
+                print(f"Total Memories: {result['count']}")
+                print()
+
+                for i, mem in enumerate(result.get('memories', []), 1):
+                    mem_id = mem.get('memory_id', mem.get('id', 'unknown'))
+                    print(f"[{i}] {mem_id}")
+                    print(f"    Type: {mem.get('memory_type', 'episodic')} | Category: {mem.get('category', 'general')}")
+                    print(f"    Importance: {mem.get('importance', 0.0):.2f}")
+                    print(f"    Created: {mem.get('created_at', 'unknown')}")
+                    content = mem.get('content', '').encode('ascii', 'replace').decode('ascii')
+                    print(f"    Content: {content}")
+                    if mem.get('task_context'):
+                        print(f"    Task: {mem['task_context']}")
+                    print()
+
+            elif args.command == "consolidate":
+                if "error" in result:
+                    print(f"[ERROR] {result['error']}")
+                else:
+                    print("=" * 80)
+                    print("MEMORY CONSOLIDATION RESULT")
+                    print("=" * 80)
+                    print(f"New Memory ID: {result['new_memory_id']}")
+                    print(f"Consolidation Type: {result['consolidation_type']}")
+                    print(f"Source Memories: {len(result['source_memory_ids'])}")
+                    print(f"New Memory Type: {result['new_memory_type']}")
+                    print()
+                    print("CONSOLIDATED CONTENT:")
+                    print("-" * 80)
+                    content = result['content'].encode('ascii', 'replace').decode('ascii')
+                    print(content)
+                    print()
+                    if result.get('provenance'):
+                        print("PROVENANCE:")
+                        print(json.dumps(result['provenance'], indent=2))
+        else:
+            # Compact AI-optimized output (default)
+            if args.command == "init":
+                print(format_compact_init(result))
+            elif args.command == "search":
+                print(format_compact_search(result))
+            elif args.command == "get":
+                print(format_compact_get(result))
+            elif args.command == "store":
+                print(f"STORED id={result['memory_id']}")
+                if result.get('similar_memories'):
+                    print(f"SIMILAR count={len(result['similar_memories'])}")
+                    for sim in result['similar_memories']:
+                        print(f"SIMILAR_MEM id={sim['id']} category={sim['category']}")
+            elif args.command == "update":
+                print(f"UPDATED id={result['memory_id']} changes={','.join(result.get('changes', []))}")
+            elif args.command == "stats":
+                version_str = f" version={result['version']}" if result.get('version') else ""
+                fixes_str = f" fixes={','.join(result['fixes'])}" if result.get('fixes') else ""
+                print(f"STATS{version_str}{fixes_str} memories={result.get('total_memories', 0)} categories={result.get('total_categories', 0)} tags={result.get('total_unique_tags', 0)}")
+            elif args.command == "get-session":
+                print(f"SESSION count={result['count']} session_id={result.get('session_id', 'all')}")
+                for mem in result.get('memories', []):
+                    mem_id = mem.get('memory_id', mem.get('id', 'unknown'))
+                    print(f"MEMORY id={mem_id} type={mem.get('memory_type', 'episodic')} category={mem.get('category', 'general')}")
+            elif args.command == "consolidate":
+                if "error" in result:
+                    print(f"ERROR {result['error']}")
+                else:
+                    print(f"CONSOLIDATED new_id={result['new_memory_id']} source_count={len(result['source_memory_ids'])} type={result['consolidation_type']}")
+            else:
+                # Fallback for other commands - use JSON
+                print(json.dumps(result, default=str))
 
     finally:
         await cli.shutdown()

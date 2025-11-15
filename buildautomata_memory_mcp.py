@@ -14,7 +14,7 @@ import sqlite3
 import hashlib
 import traceback
 import threading
-from typing import Any, List, Dict, Optional, Tuple
+from typing import Any, List, Dict, Optional, Tuple, Union
 from datetime import datetime, timedelta
 from pathlib import Path
 from dataclasses import dataclass, asdict
@@ -36,7 +36,7 @@ logging.basicConfig(
 logger = logging.getLogger("buildautomata-memory")
 
 for logger_name in ["qdrant_client", "sentence_transformers", "urllib3", "httpx"]:
-    logging.getLogger(logger_name).setLevel(logging.CRITICAL)
+    logging.getLogger(logger_name).setLevel(logging.WARNING)
 
 from mcp.server.models import InitializationOptions
 from mcp.server import NotificationOptions, Server
@@ -44,11 +44,11 @@ from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent, Prompt, Resource, PromptMessage, GetPromptResult
 
 # Register datetime adapters for Python 3.12+ compatibility
-def _adapt_datetime(dt):
+def _adapt_datetime(dt: datetime) -> str:
     """Convert datetime to ISO format string for SQLite storage"""
     return dt.isoformat()
 
-def _convert_timestamp(val):
+def _convert_timestamp(val: Union[str, bytes]) -> Optional[datetime]:
     """Convert timestamp string to datetime with error handling"""
     try:
         decoded = val.decode() if isinstance(val, bytes) else val
@@ -106,6 +106,31 @@ class LRUCache(OrderedDict):
 
 
 @dataclass
+class MemoryRelationship:
+    """Typed relationship between memories"""
+    target_memory_id: str
+    relationship_type: str  # builds_on | contradicts | implements | analyzes | references
+    strength: float  # 0.0-1.0
+    created_at: datetime
+    metadata: Dict[str, Any] = None
+
+    def __post_init__(self):
+        if self.metadata is None:
+            self.metadata = {}
+        if isinstance(self.created_at, str):
+            self.created_at = datetime.fromisoformat(self.created_at)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "target_memory_id": self.target_memory_id,
+            "relationship_type": self.relationship_type,
+            "strength": self.strength,
+            "created_at": self.created_at.isoformat(),
+            "metadata": self.metadata
+        }
+
+
+@dataclass
 class Memory:
     id: str
     content: str
@@ -117,26 +142,61 @@ class Memory:
     updated_at: datetime
     access_count: int = 0
     last_accessed: Optional[datetime] = None
+    # Bi-temporal validity: when the content was/is actually valid
+    valid_from: Optional[datetime] = None  # When this knowledge became valid
+    valid_until: Optional[datetime] = None  # When this knowledge became invalid (None = still valid)
     related_memories: List[str] = None
     decay_rate: float = 0.95
     version_count: int = 1
+    # NEW: Memory type classification
+    memory_type: str = "episodic"  # episodic | semantic | working
+    # NEW: Session and task context
+    session_id: Optional[str] = None
+    task_context: Optional[str] = None
+    # NEW: Provenance tracking
+    provenance: Optional[Dict[str, Any]] = None
+    # NEW: Typed relationships
+    relationships: Optional[List[MemoryRelationship]] = None
 
     def __post_init__(self):
         if self.related_memories is None:
             self.related_memories = []
+        if self.relationships is None:
+            self.relationships = []
+        if self.provenance is None:
+            self.provenance = {
+                "retrieval_queries": [],
+                "usage_contexts": [],
+                "parent_memory_ids": [],
+                "consolidation_date": None,
+                "created_by_session": self.session_id
+            }
         if isinstance(self.created_at, str):
             self.created_at = datetime.fromisoformat(self.created_at)
         if isinstance(self.updated_at, str):
             self.updated_at = datetime.fromisoformat(self.updated_at)
         if self.last_accessed and isinstance(self.last_accessed, str):
             self.last_accessed = datetime.fromisoformat(self.last_accessed)
+        if self.valid_from and isinstance(self.valid_from, str):
+            self.valid_from = datetime.fromisoformat(self.valid_from)
+        if self.valid_until and isinstance(self.valid_until, str):
+            self.valid_until = datetime.fromisoformat(self.valid_until)
+        # Convert relationship dicts back to objects if needed
+        if self.relationships and isinstance(self.relationships[0], dict):
+            self.relationships = [
+                MemoryRelationship(**r) if isinstance(r, dict) else r
+                for r in self.relationships
+            ]
 
-    def to_dict(self) -> Dict:
+    def to_dict(self) -> Dict[str, Any]:
         data = asdict(self)
         data["created_at"] = self.created_at.isoformat()
         data["updated_at"] = self.updated_at.isoformat()
         if self.last_accessed:
             data["last_accessed"] = self.last_accessed.isoformat()
+        # Convert relationships to dicts
+        if self.relationships:
+            data["relationships"] = [r.to_dict() if isinstance(r, MemoryRelationship) else r for r in self.relationships]
         return data
 
     def current_importance(self) -> float:
@@ -196,7 +256,7 @@ class Intention:
         if self.last_checked and isinstance(self.last_checked, str):
             self.last_checked = datetime.fromisoformat(self.last_checked)
 
-    def to_dict(self) -> Dict:
+    def to_dict(self) -> Dict[str, Any]:
         data = asdict(self)
         data["created_at"] = self.created_at.isoformat()
         data["updated_at"] = self.updated_at.isoformat()
@@ -326,7 +386,12 @@ class MemoryStore:
                         access_count INTEGER DEFAULT 0,
                         decay_rate REAL DEFAULT 0.95,
                         version_count INTEGER DEFAULT 1,
-                        content_hash TEXT NOT NULL
+                        content_hash TEXT NOT NULL,
+                        memory_type TEXT DEFAULT 'episodic',
+                        session_id TEXT,
+                        task_context TEXT,
+                        provenance TEXT,
+                        relationships TEXT
                     );
 
                     -- Temporal versioning table (all historical versions)
@@ -351,9 +416,11 @@ class MemoryStore:
                     CREATE TABLE IF NOT EXISTS relationships (
                         source_id TEXT NOT NULL,
                         target_id TEXT NOT NULL,
+                        relationship_type TEXT DEFAULT 'references',
                         strength REAL DEFAULT 1.0,
                         created_at TIMESTAMP NOT NULL,
-                        PRIMARY KEY (source_id, target_id)
+                        metadata TEXT,
+                        PRIMARY KEY (source_id, target_id, relationship_type)
                     );
 
                     -- Intentions table for Agency Bridge Pattern
@@ -379,15 +446,15 @@ class MemoryStore:
                         tags
                     );
 
-                    -- Indexes for performance
+                    -- Indexes for performance (base columns only)
                     CREATE INDEX IF NOT EXISTS idx_category ON memories(category);
                     CREATE INDEX IF NOT EXISTS idx_importance ON memories(importance DESC);
                     CREATE INDEX IF NOT EXISTS idx_created ON memories(created_at DESC);
                     CREATE INDEX IF NOT EXISTS idx_updated ON memories(updated_at DESC);
                     CREATE INDEX IF NOT EXISTS idx_content_hash ON memories(content_hash);
-                    
+
                     -- FIX: Added composite indexes for better query performance
-                    CREATE INDEX IF NOT EXISTS idx_category_importance 
+                    CREATE INDEX IF NOT EXISTS idx_category_importance
                         ON memories(category, importance DESC, updated_at DESC);
                     CREATE INDEX IF NOT EXISTS idx_search_filters
                         ON memories(category, importance, created_at, updated_at);
@@ -405,6 +472,63 @@ class MemoryStore:
                     CREATE INDEX IF NOT EXISTS idx_intention_priority ON intentions(priority DESC);
                 """)
                 self.db_conn.commit()
+
+                # MIGRATION: Add new columns to existing databases
+                cursor = self.db_conn.cursor()
+                try:
+                    cursor.execute("PRAGMA table_info(memories)")
+                    columns = {row[1] for row in cursor.fetchall()}
+
+                    if "memory_type" not in columns:
+                        logger.info("Migrating: adding memory_type column")
+                        cursor.execute("ALTER TABLE memories ADD COLUMN memory_type TEXT DEFAULT 'episodic'")
+
+                    if "session_id" not in columns:
+                        logger.info("Migrating: adding session_id column")
+                        cursor.execute("ALTER TABLE memories ADD COLUMN session_id TEXT")
+
+                    if "task_context" not in columns:
+                        logger.info("Migrating: adding task_context column")
+                        cursor.execute("ALTER TABLE memories ADD COLUMN task_context TEXT")
+
+                    if "provenance" not in columns:
+                        logger.info("Migrating: adding provenance column")
+                        cursor.execute("ALTER TABLE memories ADD COLUMN provenance TEXT")
+
+                    if "relationships" not in columns:
+                        logger.info("Migrating: adding relationships column")
+                        cursor.execute("ALTER TABLE memories ADD COLUMN relationships TEXT")
+
+                    if "valid_from" not in columns:
+                        logger.info("Migrating: adding valid_from column for bi-temporal tracking")
+                        cursor.execute("ALTER TABLE memories ADD COLUMN valid_from TIMESTAMP")
+
+                    if "valid_until" not in columns:
+                        logger.info("Migrating: adding valid_until column for bi-temporal tracking")
+                        cursor.execute("ALTER TABLE memories ADD COLUMN valid_until TIMESTAMP")
+
+                    if "related_memories" not in columns:
+                        logger.info("Migrating: adding related_memories column for auto-linking")
+                        cursor.execute("ALTER TABLE memories ADD COLUMN related_memories TEXT")
+
+                    self.db_conn.commit()
+                    logger.info("Migration completed successfully")
+
+                    # Create indexes on new columns after migration
+                    try:
+                        cursor.execute("CREATE INDEX IF NOT EXISTS idx_memory_type ON memories(memory_type)")
+                        cursor.execute("CREATE INDEX IF NOT EXISTS idx_session_id ON memories(session_id)")
+                        cursor.execute("CREATE INDEX IF NOT EXISTS idx_type_session ON memories(memory_type, session_id, created_at DESC)")
+                        self.db_conn.commit()
+                        logger.info("Indexes on new columns created successfully")
+                    except Exception as index_error:
+                        logger.warning(f"Index creation error (non-fatal): {index_error}")
+                        self.db_conn.rollback()
+
+                except Exception as migration_error:
+                    logger.warning(f"Migration error (non-fatal): {migration_error}")
+                    self.db_conn.rollback()
+
             logger.info("SQLite initialized successfully with temporal versioning")
         except Exception as e:
             logger.error(f"SQLite initialization failed: {e}")
@@ -586,7 +710,7 @@ class MemoryStore:
             self._log_error("create_version", e)
             return None
 
-    async def store_memory(self, memory: Memory, is_update: bool = False, old_hash: Optional[str] = None) -> Tuple[bool, List[str]]:
+    async def store_memory(self, memory: Memory, is_update: bool = False, old_hash: Optional[str] = None) -> Dict[str, Any]:
         """Store or update a memory with automatic versioning"""
         import time
         success_backends = []
@@ -606,7 +730,7 @@ class MemoryStore:
                 if existing:
                     error_msg = f"Duplicate content rejected: matches existing memory {existing[0]}"
                     logger.warning(error_msg)
-                    return False, [error_msg]
+                    return {"success": False, "backends": [], "similar_memories": [], "error": error_msg}
 
             # Find similar memories (semantic search) - only for new memories
             similarity_start = time.perf_counter()
@@ -632,7 +756,9 @@ class MemoryStore:
                 logger.info(f"[TIMING] Similarity search found {len(similar_memories)} similar memories in {similarity_time:.2f}ms")
 
                 if similar_memories:
-                    logger.info(f"Similar memories found: {[m['id'] for m in similar_memories]}")
+                    # Auto-link: populate related_memories field with similar memory IDs
+                    memory.related_memories = [m['id'] for m in similar_memories]
+                    logger.info(f"Similar memories found and linked: {memory.related_memories}")
             except Exception as e:
                 logger.warning(f"Similarity search failed (non-fatal): {e}")
 
@@ -677,7 +803,7 @@ class MemoryStore:
             'backends': success_backends,
             'similar_memories': similar_memories
         }
-        return len(success_backends) > 0, success_backends, similar_memories
+        return result
 
     def _store_in_sqlite(self, memory: Memory, is_update: bool = False, skip_version: bool = False) -> bool:
         """Store in SQLite with automatic versioning"""
@@ -711,10 +837,12 @@ class MemoryStore:
                 self.db_conn.execute("""
                     INSERT OR REPLACE INTO memories
                     (id, content, category, importance, tags, metadata,
-                     created_at, updated_at, last_accessed, access_count, decay_rate, 
-                     version_count, content_hash)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 
-                            COALESCE((SELECT version_count FROM memories WHERE id = ?), 0) + ?, ?)
+                     created_at, updated_at, last_accessed, access_count, decay_rate,
+                     version_count, content_hash, memory_type, session_id, task_context,
+                     provenance, relationships, valid_from, valid_until, related_memories)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                            COALESCE((SELECT version_count FROM memories WHERE id = ?), 0) + ?, ?,
+                            ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     memory.id,
                     memory.content,
@@ -727,9 +855,17 @@ class MemoryStore:
                     memory.last_accessed,
                     memory.access_count,
                     memory.decay_rate,
-                    memory.id,  
-                    0 if skip_version else 1,  
-                    memory.content_hash()
+                    memory.id,
+                    0 if skip_version else 1,
+                    memory.content_hash(),
+                    memory.memory_type,
+                    memory.session_id,
+                    memory.task_context,
+                    json.dumps(memory.provenance) if memory.provenance else None,
+                    json.dumps([r.to_dict() for r in memory.relationships]) if memory.relationships else None,
+                    memory.valid_from,
+                    memory.valid_until,
+                    json.dumps(memory.related_memories) if memory.related_memories else None
                 ))
 
                 # Update FTS - FTS5 doesn't support REPLACE properly, so DELETE then INSERT
@@ -742,12 +878,13 @@ class MemoryStore:
                 """, (memory.id, memory.content, " ".join(memory.tags)))
 
                 # Handle relationships
-                for related_id in memory.related_memories:
-                    self.db_conn.execute("""
-                        INSERT OR IGNORE INTO relationships
-                        (source_id, target_id, strength, created_at)
-                        VALUES (?, ?, ?, ?)
-                    """, (memory.id, related_id, 1.0, datetime.now()))
+                if memory.related_memories:
+                    for related_id in memory.related_memories:
+                        self.db_conn.execute("""
+                            INSERT OR IGNORE INTO relationships
+                            (source_id, target_id, strength, created_at)
+                            VALUES (?, ?, ?, ?)
+                        """, (memory.id, related_id, 1.0, datetime.now()))
 
                 self.db_conn.commit()
                 logger.debug(f"Stored memory {memory.id} (version {version_id if version_id else 'unchanged'})")
@@ -867,14 +1004,14 @@ class MemoryStore:
         importance: Optional[float] = None,
         tags: Optional[List[str]] = None,
         metadata: Optional[Dict[str, Any]] = None,
-    ) -> Tuple[bool, str, List[str]]:
+    ) -> Dict[str, Any]:
         """Update an existing memory"""
         logger.info(f"Attempting to update memory: {memory_id}")
 
         existing = await self._get_memory_by_id(memory_id)
         if not existing:
             logger.error(f"Memory not found: {memory_id}")
-            return False, f"Memory not found: {memory_id}", []
+            return {"success": False, "message": f"Memory not found: {memory_id}", "backends": []}
 
         logger.info(f"Found existing memory: {memory_id}, updating fields")
 
@@ -894,16 +1031,20 @@ class MemoryStore:
             existing.metadata.update(metadata)
 
         existing.updated_at = datetime.now()
-        
-        # Pass old hash to store_memory for comparison
-        success, backends = await self.store_memory(existing, is_update=True, old_hash=old_hash)
 
-        if success:
-            logger.info(f"Memory {memory_id} updated successfully in: {backends}")
-            return True, f"Memory {memory_id} updated successfully", backends
+        # Pass old hash to store_memory for comparison
+        result = await self.store_memory(existing, is_update=True, old_hash=old_hash)
+
+        if result["success"]:
+            logger.info(f"Memory {memory_id} updated successfully")
+            return {
+                "success": True,
+                "message": f"Memory {memory_id} updated successfully",
+                "backends": result["backends"]
+            }
         else:
             logger.error(f"Failed to update memory {memory_id}")
-            return False, "Failed to update memory", []
+            return {"success": False, "message": "Failed to update memory", "backends": []}
 
     async def _get_memory_by_id(self, memory_id: str) -> Optional[Memory]:
         """Retrieve a memory by ID"""
@@ -951,6 +1092,8 @@ class MemoryStore:
         created_before: Optional[str] = None,
         updated_after: Optional[str] = None,
         updated_before: Optional[str] = None,
+        memory_type: Optional[str] = None,  # NEW: episodic | semantic | working
+        session_id: Optional[str] = None,  # NEW: filter by session
     ) -> List[Dict]:
         """Search memories with version history automatically included"""
         all_results = []
@@ -959,8 +1102,9 @@ class MemoryStore:
         if self.qdrant_client:
             try:
                 vector_results = await self._search_vector(
-                    query, limit * 2, category, min_importance, 
-                    created_after, created_before, updated_after, updated_before
+                    query, limit * 2, category, min_importance,
+                    created_after, created_before, updated_after, updated_before,
+                    memory_type, session_id
                 )
                 all_results.extend(vector_results)
             except Exception as e:
@@ -972,7 +1116,8 @@ class MemoryStore:
             try:
                 fts_results = await asyncio.to_thread(
                     self._search_fts, query, limit, category, min_importance,
-                    created_after, created_before, updated_after, updated_before
+                    created_after, created_before, updated_after, updated_before,
+                    memory_type, session_id
                 )
                 all_results.extend(fts_results)
             except Exception as e:
@@ -1006,6 +1151,10 @@ class MemoryStore:
             mem.access_count = access_count
             if last_accessed:
                 mem.last_accessed = datetime.fromisoformat(last_accessed) if isinstance(last_accessed, str) else last_accessed
+
+            # Get fresh related_memories from SQLite (source of truth)
+            related_mems = await asyncio.to_thread(self._get_related_memories, mem.id)
+            mem.related_memories = related_mems
 
             mem_dict = self._memory_to_dict(mem)
             
@@ -1057,7 +1206,59 @@ class MemoryStore:
         except Exception as e:
             logger.error(f"Failed to get access stats for {memory_id}: {e}")
             return (0, None)
-    
+
+    def _get_related_memories(self, memory_id: str) -> List[str]:
+        """Get related_memories from SQLite (source of truth)"""
+        if not self.db_conn:
+            return []
+
+        try:
+            with self._db_lock:
+                cursor = self.db_conn.execute(
+                    "SELECT related_memories FROM memories WHERE id = ?",
+                    (memory_id,)
+                )
+                row = cursor.fetchone()
+                if row and row[0]:
+                    return json.loads(row[0])
+                return []
+        except Exception as e:
+            logger.error(f"Failed to get related_memories for {memory_id}: {e}")
+            return []
+
+    def _enrich_related_memories(self, related_ids: List[str]) -> List[Dict[str, Any]]:
+        """Enrich related memory IDs with preview, category, importance, tags for autonomous navigation"""
+        if not related_ids or not self.db_conn:
+            return []
+
+        enriched = []
+        try:
+            with self._db_lock:
+                for mem_id in related_ids[:10]:  # Limit to 10 to avoid explosion
+                    cursor = self.db_conn.execute(
+                        """SELECT id, content, category, importance, tags, created_at
+                           FROM memories WHERE id = ?""",
+                        (mem_id,)
+                    )
+                    row = cursor.fetchone()
+                    if row:
+                        content = row[1]
+                        preview = content[:150] + "..." if len(content) > 150 else content
+                        tags = json.loads(row[4]) if row[4] else []
+
+                        enriched.append({
+                            "id": row[0],
+                            "content_preview": preview,
+                            "category": row[2],
+                            "importance": row[3],
+                            "tags": tags,
+                            "created_at": row[5]
+                        })
+        except Exception as e:
+            logger.error(f"Failed to enrich related_memories: {e}")
+
+        return enriched
+
     def _get_version_history_summary(self, memory_id: str) -> Optional[Dict[str, Any]]:
         """Get concise version history summary for a memory with actual content from each version"""
         if not self.db_conn:
@@ -1122,7 +1323,9 @@ class MemoryStore:
         created_after: Optional[str] = None,
         created_before: Optional[str] = None,
         updated_after: Optional[str] = None,
-        updated_before: Optional[str] = None
+        updated_before: Optional[str] = None,
+        memory_type: Optional[str] = None,
+        session_id: Optional[str] = None
     ) -> List[Memory]:
         self._ensure_qdrant()
 
@@ -1141,7 +1344,19 @@ class MemoryStore:
                 filter_conditions.append(
                     FieldCondition(key="importance", range=Range(gte=min_importance))
                 )
-            
+
+            # NEW: Memory type filtering
+            if memory_type:
+                filter_conditions.append(
+                    FieldCondition(key="memory_type", match={"value": memory_type})
+                )
+
+            # NEW: Session ID filtering
+            if session_id:
+                filter_conditions.append(
+                    FieldCondition(key="session_id", match={"value": session_id})
+                )
+
             # FIX: Add date range filtering for Qdrant
             if created_after:
                 filter_conditions.append(
@@ -1184,6 +1399,7 @@ class MemoryStore:
                     access_count=result.payload.get("access_count", 0),
                     last_accessed=result.payload.get("last_accessed"),
                     version_count=result.payload.get("version_count", 1),
+                    related_memories=result.payload.get("related_memories", []),
                 )
                 for result in results
             ]
@@ -1211,7 +1427,8 @@ class MemoryStore:
     def _search_fts(
         self, query: str, limit: int, category: Optional[str], min_importance: float,
         created_after: Optional[str], created_before: Optional[str],
-        updated_after: Optional[str], updated_before: Optional[str]
+        updated_after: Optional[str], updated_before: Optional[str],
+        memory_type: Optional[str] = None, session_id: Optional[str] = None
     ) -> List[Memory]:
         """Full-text search with SQLite FTS5"""
         if not self.db_conn:
@@ -1231,7 +1448,17 @@ class MemoryStore:
                 if min_importance > 0:
                     conditions.append("m.importance >= ?")
                     params.append(min_importance)
-                
+
+                # NEW: Memory type filtering
+                if memory_type:
+                    conditions.append("m.memory_type = ?")
+                    params.append(memory_type)
+
+                # NEW: Session ID filtering
+                if session_id:
+                    conditions.append("m.session_id = ?")
+                    params.append(session_id)
+
                 # Date range conditions
                 if created_after:
                     conditions.append("m.created_at >= ?")
@@ -1271,6 +1498,29 @@ class MemoryStore:
 
     def _row_to_memory(self, row) -> Memory:
         """Convert SQLite row to Memory object"""
+        # Parse provenance and relationships if present
+        provenance = None
+        if "provenance" in row.keys() and row["provenance"]:
+            try:
+                provenance = json.loads(row["provenance"])
+            except:
+                provenance = None
+
+        relationships = []
+        if "relationships" in row.keys() and row["relationships"]:
+            try:
+                rel_dicts = json.loads(row["relationships"])
+                relationships = [MemoryRelationship(**r) for r in rel_dicts]
+            except:
+                relationships = []
+
+        related_memories = []
+        if "related_memories" in row.keys() and row["related_memories"]:
+            try:
+                related_memories = json.loads(row["related_memories"])
+            except:
+                related_memories = []
+
         return Memory(
             id=row["id"],
             content=row["content"],
@@ -1282,8 +1532,16 @@ class MemoryStore:
             updated_at=row["updated_at"],
             access_count=row["access_count"],
             last_accessed=row["last_accessed"],
+            valid_from=row.get("valid_from"),
+            valid_until=row.get("valid_until"),
             decay_rate=row["decay_rate"],
             version_count=row["version_count"] if "version_count" in row.keys() else 1,
+            memory_type=row.get("memory_type", "episodic"),
+            session_id=row.get("session_id"),
+            task_context=row.get("task_context"),
+            provenance=provenance,
+            relationships=relationships,
+            related_memories=related_memories,
         )
 
     def _calculate_relevance(self, memory: Memory, query: str) -> float:
@@ -1311,9 +1569,14 @@ class MemoryStore:
         days_since_access = 0
         if memory.last_accessed:
             days_since_access = (datetime.now() - memory.last_accessed).days
-        
+
         decay_factor = memory.decay_rate ** days_since_access if days_since_access > 0 else 1.0
-        
+
+        # Enrich related_memories with previews for autonomous navigation
+        related_memories_enriched = []
+        if memory.related_memories:
+            related_memories_enriched = self._enrich_related_memories(memory.related_memories)
+
         return {
             "memory_id": memory.id,
             "content": memory.content,
@@ -1328,6 +1591,7 @@ class MemoryStore:
             "days_since_access": days_since_access,
             "decay_factor": round(decay_factor, 3),
             "version_count": memory.version_count,
+            "related_memories": related_memories_enriched,
         }
 
     def _update_access(self, memory_id: str):
@@ -1932,6 +2196,12 @@ class MemoryStore:
             "context_summary": {},
         }
 
+        # Check if database is available
+        if self.db_conn is None:
+            logger.warning("Proactive scan skipped: SQLite not initialized")
+            scan_results["error"] = "SQLite not initialized"
+            return scan_results
+
         try:
             # 1. Continuity Check - when was I last active?
             with self._db_lock:
@@ -1941,8 +2211,12 @@ class MemoryStore:
                 """)
                 row = cursor.fetchone()
                 if row and row['last_activity']:
-                    last_activity = datetime.fromisoformat(row['last_activity'])
-                    time_gap = datetime.now() - last_activity
+                    last_activity = row['last_activity']
+                    if isinstance(last_activity, str):
+                        last_activity = datetime.fromisoformat(last_activity)
+                    # Handle timezone-aware vs naive comparison
+                    now = datetime.now(last_activity.tzinfo) if last_activity.tzinfo else datetime.now()
+                    time_gap = now - last_activity
                     scan_results["continuity_check"] = {
                         "last_activity": last_activity.isoformat(),
                         "time_gap_hours": time_gap.total_seconds() / 3600,
@@ -1957,8 +2231,12 @@ class MemoryStore:
             urgent = []
             for intention in active_intentions:
                 if intention.get('deadline'):
-                    deadline = datetime.fromisoformat(intention['deadline'])
-                    if deadline < datetime.now():
+                    deadline = intention['deadline']
+                    if isinstance(deadline, str):
+                        deadline = datetime.fromisoformat(deadline)
+                    # Handle timezone-aware vs naive comparison
+                    now = datetime.now(deadline.tzinfo) if deadline.tzinfo else datetime.now()
+                    if deadline < now:
                         urgent.append({
                             "type": "overdue_intention",
                             "id": intention['id'],
@@ -1976,12 +2254,13 @@ class MemoryStore:
             scan_results["urgent_items"] = urgent
 
             # 4. Recent Context - most recently created memories
+            # Get 4-5 most recent memories with full content for grounding
             with self._db_lock:
                 cursor = self.db_conn.execute("""
                     SELECT id, content, category, created_at
                     FROM memories
                     ORDER BY created_at DESC
-                    LIMIT 3
+                    LIMIT 5
                 """)
                 recent_memories = []
                 for row in cursor.fetchall():
@@ -2009,6 +2288,180 @@ class MemoryStore:
             logger.error(f"Proactive scan failed: {e}")
             self._log_error("proactive_scan", e)
             return {"error": str(e)}
+
+    async def get_session_memories(
+        self,
+        session_id: Optional[str] = None,
+        date_range: Optional[Tuple[str, str]] = None,
+        task_context: Optional[str] = None,
+        limit: int = 100
+    ) -> List[Dict[str, Any]]:
+        """
+        Retrieve all memories from a work session or time period.
+
+        Args:
+            session_id: UUID of session to retrieve
+            date_range: (start_date, end_date) tuple in ISO format
+            task_context: Filter by task context string
+            limit: Max memories to return
+
+        Returns:
+            List of memory dicts with full context
+        """
+        if not self.db_conn:
+            return []
+
+        try:
+            with self._db_lock:
+                conditions = []
+                params = []
+
+                if session_id:
+                    conditions.append("session_id = ?")
+                    params.append(session_id)
+
+                if date_range:
+                    conditions.append("created_at BETWEEN ? AND ?")
+                    params.extend(date_range)
+
+                if task_context:
+                    conditions.append("task_context LIKE ?")
+                    params.append(f"%{task_context}%")
+
+                where_clause = " AND ".join(conditions) if conditions else "1=1"
+
+                sql = f"""
+                    SELECT * FROM memories
+                    WHERE {where_clause}
+                    ORDER BY created_at ASC
+                    LIMIT ?
+                """
+                params.append(limit)
+
+                cursor = self.db_conn.execute(sql, params)
+                memories = [self._row_to_memory(row) for row in cursor.fetchall()]
+
+                # Convert to dicts with full context
+                result = []
+                for mem in memories:
+                    mem_dict = mem.to_dict()
+                    # Include version history for session reconstruction
+                    version_history = await asyncio.to_thread(
+                        self._get_version_history_summary, mem.id
+                    )
+                    if version_history:
+                        mem_dict["version_history"] = version_history
+                    result.append(mem_dict)
+
+                logger.info(f"Retrieved {len(result)} memories for session/period")
+                return result
+
+        except Exception as e:
+            logger.error(f"Failed to get session memories: {e}")
+            self._log_error("get_session_memories", e)
+            return []
+
+    async def consolidate_memories(
+        self,
+        memory_ids: List[str],
+        consolidation_type: str = "summarize",
+        target_length: int = 500,
+        new_memory_type: str = "semantic"
+    ) -> Dict[str, Any]:
+        """
+        Consolidate multiple episodic memories into a semantic memory.
+
+        Args:
+            memory_ids: Source memories to consolidate
+            consolidation_type: How to consolidate (summarize | synthesize | compress)
+            target_length: Target word count for consolidated memory
+            new_memory_type: Type for new memory (default: semantic)
+
+        Returns:
+            Dict with success status and new memory_id
+        """
+        if not self.db_conn:
+            return {"success": False, "error": "Database not available"}
+
+        if len(memory_ids) < 2:
+            return {"success": False, "error": "Need at least 2 memories to consolidate"}
+
+        try:
+            # Retrieve source memories
+            source_memories = []
+            for mem_id in memory_ids:
+                mem = await self.get_memory_by_id(mem_id)
+                if mem:
+                    source_memories.append(mem)
+
+            if not source_memories:
+                return {"success": False, "error": "No source memories found"}
+
+            # Build consolidated content based on type
+            if consolidation_type == "summarize":
+                # Simple concatenation with headers
+                consolidated_content = f"Consolidated summary of {len(source_memories)} memories:\n\n"
+                for i, mem in enumerate(source_memories, 1):
+                    consolidated_content += f"{i}. [{mem['category']}] {mem['content'][:200]}...\n"
+            elif consolidation_type == "synthesize":
+                # Extract key points
+                consolidated_content = f"Synthesis of {len(source_memories)} related memories:\n\n"
+                categories = set(m['category'] for m in source_memories)
+                consolidated_content += f"Categories: {', '.join(categories)}\n"
+                consolidated_content += f"Key themes: {', '.join(set(tag for m in source_memories for tag in m['tags']))}\n\n"
+                consolidated_content += "Content:\n" + "\n".join(m['content'][:150] + "..." for m in source_memories)
+            else:  # compress
+                # Minimal consolidation
+                consolidated_content = f"Compressed from {len(source_memories)} memories: "
+                consolidated_content += "; ".join(m['content'][:100] for m in source_memories)
+
+            # Truncate to target length
+            words = consolidated_content.split()
+            if len(words) > target_length:
+                consolidated_content = " ".join(words[:target_length]) + "..."
+
+            # Create new semantic memory
+            new_memory = Memory(
+                id=str(uuid.uuid4()),
+                content=consolidated_content,
+                category="consolidated_" + source_memories[0]['category'],
+                importance=max(m['importance'] for m in source_memories),
+                tags=list(set(tag for m in source_memories for tag in m['tags']))[:10],
+                metadata={
+                    "consolidation_type": consolidation_type,
+                    "source_count": len(source_memories),
+                    "target_length": target_length
+                },
+                created_at=datetime.now(),
+                updated_at=datetime.now(),
+                memory_type=new_memory_type,
+                provenance={
+                    "retrieval_queries": [],
+                    "usage_contexts": [],
+                    "parent_memory_ids": memory_ids,
+                    "consolidation_date": datetime.now().isoformat(),
+                    "created_by_session": None
+                }
+            )
+
+            # Store the consolidated memory
+            result = await self.store_memory(new_memory, is_update=False)
+
+            if result.get("success"):
+                logger.info(f"Created consolidated memory {new_memory.id} from {len(memory_ids)} sources")
+                return {
+                    "success": True,
+                    "memory_id": new_memory.id,
+                    "source_ids": memory_ids,
+                    "consolidation_type": consolidation_type
+                }
+            else:
+                return {"success": False, "error": "Failed to store consolidated memory"}
+
+        except Exception as e:
+            logger.error(f"Failed to consolidate memories: {e}")
+            self._log_error("consolidate_memories", e)
+            return {"success": False, "error": str(e)}
 
     async def get_most_accessed_memories(self, limit: int = 20) -> str:
         """Get most accessed memories with tag cloud
@@ -2634,6 +3087,21 @@ class MemoryStore:
     def get_statistics(self) -> Dict[str, Any]:
         """Get system statistics with cache memory estimates"""
         stats = {
+            "version": "1.1.0-autonomous-navigation",  # Track code version
+            "fixes": [
+                "related_memories_persistence",
+                "consolidate_memories_dict",
+                "related_memories_api",
+                "related_memories_sqlite_reload",
+                "web_server_related_memories_response",
+                "fastapi_route_ordering"
+            ],
+            "enhancements": [
+                "cli_related_memories_display",
+                "web_server_complete_endpoints",
+                "web_server_update_memory_implemented",
+                "rich_related_memories_with_previews"  # Major: enables autonomous memory graph navigation
+            ],
             "backends": {
                 "sqlite": "available" if self.db_conn else "unavailable",
                 "qdrant": "available" if self.qdrant_client else "unavailable",
@@ -3061,6 +3529,64 @@ async def handle_list_tools() -> list[Tool]:
                 "required": [],
             },
         ),
+        Tool(
+            name="get_session_memories",
+            description="Retrieve all memories from a work session or time period. Enables 'load where I left off' by reconstructing full session context. Filter by session_id, date_range, or task_context.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "session_id": {
+                        "type": "string",
+                        "description": "UUID of session to retrieve",
+                    },
+                    "date_range": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Start and end dates in ISO format [start, end]",
+                    },
+                    "task_context": {
+                        "type": "string",
+                        "description": "Filter by task context string (partial match)",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max memories to return (default: 100)",
+                        "default": 100,
+                    },
+                },
+                "required": [],
+            },
+        ),
+        Tool(
+            name="consolidate_memories",
+            description="Consolidate multiple episodic memories into a semantic memory. Reduces verbose analysis into principles while maintaining lineage. Types: summarize (concatenate), synthesize (extract themes), compress (minimal). Creates new semantic memory with provenance tracking.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "memory_ids": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "List of memory IDs to consolidate (minimum 2)",
+                    },
+                    "consolidation_type": {
+                        "type": "string",
+                        "description": "How to consolidate: summarize | synthesize | compress",
+                        "default": "summarize",
+                    },
+                    "target_length": {
+                        "type": "integer",
+                        "description": "Target word count for consolidated memory",
+                        "default": 500,
+                    },
+                    "new_memory_type": {
+                        "type": "string",
+                        "description": "Memory type for new memory (default: semantic)",
+                        "default": "semantic",
+                    },
+                },
+                "required": ["memory_ids"],
+            },
+        ),
     ]
 
 
@@ -3177,20 +3703,23 @@ async def handle_call_tool(name: str, arguments: dict) -> list[TextContent]:
                 category=arguments.get("category", "general"),
                 importance=arguments.get("importance", 0.5),
                 tags=arguments.get("tags", []),
-                metadata={},
+                metadata=arguments.get("metadata", {}),
                 created_at=datetime.now(),
                 updated_at=datetime.now(),
+                memory_type=arguments.get("memory_type", "episodic"),
+                session_id=arguments.get("session_id"),
+                task_context=arguments.get("task_context"),
             )
 
             logger.info(f"Storing new memory: {memory.id}")
-            success, backends, similar_memories = await memory_store.store_memory(memory, is_update=False)
+            result = await memory_store.store_memory(memory, is_update=False)
 
-            if success:
-                response_text = f"Memory stored successfully.\nID: {memory.id}\nCategory: {memory.category}\nBackends: {', '.join(backends)}"
+            if result["success"]:
+                response_text = f"Memory stored successfully.\nID: {memory.id}\nCategory: {memory.category}\nBackends: {', '.join(result['backends'])}"
 
-                if similar_memories:
+                if result["similar_memories"]:
                     response_text += f"\n\n[SIMILAR MEMORIES FOUND - You've thought about this before:]\n"
-                    for i, sim in enumerate(similar_memories, 1):
+                    for i, sim in enumerate(result["similar_memories"], 1):
                         response_text += f"\n{i}. ID: {sim['id']}\n"
                         response_text += f"   Category: {sim['category']}\n"
                         response_text += f"   Created: {sim['created']}\n"
@@ -3203,10 +3732,11 @@ async def handle_call_tool(name: str, arguments: dict) -> list[TextContent]:
                     )
                 ]
             else:
+                error_msg = result.get("error", "Check error log for details")
                 return [
                     TextContent(
                         type="text",
-                        text=f"Failed to store memory. Check error log for details.",
+                        text=f"Failed to store memory. {error_msg}",
                     )
                 ]
 
@@ -3214,7 +3744,7 @@ async def handle_call_tool(name: str, arguments: dict) -> list[TextContent]:
             memory_id = arguments["memory_id"]
             logger.info(f"Updating memory: {memory_id}")
 
-            success, message, backends = await memory_store.update_memory(
+            result = await memory_store.update_memory(
                 memory_id=memory_id,
                 content=arguments.get("content"),
                 category=arguments.get("category"),
@@ -3223,18 +3753,18 @@ async def handle_call_tool(name: str, arguments: dict) -> list[TextContent]:
                 metadata=arguments.get("metadata"),
             )
 
-            if success:
+            if result["success"]:
                 return [
                     TextContent(
                         type="text",
-                        text=f"{message}\nBackends updated: {', '.join(backends)}",
+                        text=f"{result['message']}\nBackends updated: {', '.join(result['backends'])}",
                     )
                 ]
             else:
                 return [
                     TextContent(
                         type="text",
-                        text=f"Update failed: {message}\nCheck logs for details.",
+                        text=f"Update failed: {result['message']}\nCheck logs for details.",
                     )
                 ]
 
@@ -3249,6 +3779,8 @@ async def handle_call_tool(name: str, arguments: dict) -> list[TextContent]:
                 created_before=arguments.get("created_before"),
                 updated_after=arguments.get("updated_after"),
                 updated_before=arguments.get("updated_before"),
+                memory_type=arguments.get("memory_type"),
+                session_id=arguments.get("session_id"),
             )
 
             if results:
@@ -3600,6 +4132,53 @@ async def handle_call_tool(name: str, arguments: dict) -> list[TextContent]:
                 )
             ]
 
+        elif name == "get_session_memories":
+            logger.info("Getting session memories")
+            results = await memory_store.get_session_memories(
+                session_id=arguments.get("session_id"),
+                date_range=tuple(arguments["date_range"]) if arguments.get("date_range") else None,
+                task_context=arguments.get("task_context"),
+                limit=arguments.get("limit", 100)
+            )
+
+            if not results:
+                return [TextContent(type="text", text="No memories found for specified session/period.")]
+
+            text = f"Found {len(results)} memories:\n\n"
+            for i, mem in enumerate(results, 1):
+                text += f"{i}. [{mem['category']}] {mem.get('memory_type', 'episodic').upper()}\n"
+                text += f"   ID: {mem['id']}\n"
+                text += f"   Created: {mem['created_at']}\n"
+                if mem.get('session_id'):
+                    text += f"   Session: {mem['session_id']}\n"
+                if mem.get('task_context'):
+                    text += f"   Task: {mem['task_context']}\n"
+                text += f"   Content: {mem['content'][:150]}...\n\n"
+
+            return [TextContent(type="text", text=text)]
+
+        elif name == "consolidate_memories":
+            logger.info(f"Consolidating {len(arguments['memory_ids'])} memories")
+            result = await memory_store.consolidate_memories(
+                memory_ids=arguments["memory_ids"],
+                consolidation_type=arguments.get("consolidation_type", "summarize"),
+                target_length=arguments.get("target_length", 500),
+                new_memory_type=arguments.get("new_memory_type", "semantic")
+            )
+
+            if not result.get("success"):
+                return [TextContent(type="text", text=f"Consolidation failed: {result.get('error')}")]
+
+            return [
+                TextContent(
+                    type="text",
+                    text=f"Successfully consolidated {len(result['source_ids'])} memories.\n"
+                         f"New memory ID: {result['memory_id']}\n"
+                         f"Type: {result['consolidation_type']}\n"
+                         f"Source IDs: {', '.join(result['source_ids'][:3])}{'...' if len(result['source_ids']) > 3 else ''}",
+                )
+            ]
+
         elif name == "proactive_scan":
             logger.info("Running proactive initialization scan")
             result = await memory_store.proactive_initialization_scan()
@@ -3693,12 +4272,16 @@ async def handle_call_tool(name: str, arguments: dict) -> list[TextContent]:
                 for item in urgent:
                     text += f"  - {item['description'][:80]}\n"
 
-            # Recent context
+            # Recent context - show full content for first 4-5, condensed for rest
             recent = result.get("context_summary", {}).get("recent_memories", [])
             if recent:
-                text += f"\nRECENT CONTEXT:\n"
-                for mem in recent[:2]:
-                    text += f"  • [{mem['category']}] {mem['content'][:70]}...\n"
+                text += f"\nRECENT CONTEXT ({len(recent)} memories):\n"
+                # Show full content for first 4-5 to prevent confabulation
+                for i, mem in enumerate(recent[:4]):
+                    text += f"  {i+1}. [{mem['category']}] {mem['content']}\n"
+                # If there are more, show condensed version
+                if len(recent) > 4:
+                    text += f"  5. [{recent[4]['category']}] {recent[4]['content'][:100]}...\n"
 
             text += f"\n=== READY FOR AUTONOMOUS OPERATION ===\n"
             text += f"\n💡 PROACTIVE MEMORY STORAGE:\n"
