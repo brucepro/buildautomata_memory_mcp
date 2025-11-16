@@ -732,35 +732,43 @@ class MemoryStore:
                     logger.warning(error_msg)
                     return {"success": False, "backends": [], "similar_memories": [], "error": error_msg}
 
-            # Find similar memories (semantic search) - only for new memories
-            similarity_start = time.perf_counter()
-            try:
-                # Use existing search_memories with low limit for speed
-                search_results = await self.search_memories(
-                    query=memory.content,
-                    limit=3,
-                    include_versions=False
-                )
+        # Find similar memories (semantic search) - for both new and updated memories
+        similarity_start = time.perf_counter()
+        try:
+            # Use existing search_memories with low limit for speed
+            search_results = await self.search_memories(
+                query=memory.content,
+                limit=9,
+                include_versions=False
+            )
 
-                # Filter out exact matches and format results
-                for result in search_results:
-                    if result['memory_id'] != memory.id:  # Not self
-                        similar_memories.append({
-                            'id': result['memory_id'],
-                            'content_preview': result['content'][:100] + '...' if len(result['content']) > 100 else result['content'],
-                            'category': result.get('category', 'unknown'),
-                            'created': result.get('created_at', 'unknown')
-                        })
+            logger.info(f"[AUTO-LINK] Search returned {len(search_results)} results for memory {memory.id}")
 
-                similarity_time = (time.perf_counter() - similarity_start) * 1000
-                logger.info(f"[TIMING] Similarity search found {len(similar_memories)} similar memories in {similarity_time:.2f}ms")
+            # Filter out exact matches and format results
+            for result in search_results:
+                logger.info(f"[AUTO-LINK] Comparing result {result['memory_id']} with memory {memory.id}")
+                if result['memory_id'] != memory.id:  # Not self
+                    similar_memories.append({
+                        'id': result['memory_id'],
+                        'content_preview': result['content'][:100] + '...' if len(result['content']) > 100 else result['content'],
+                        'category': result.get('category', 'unknown'),
+                        'created': result.get('created_at', 'unknown')
+                    })
+                    logger.info(f"[AUTO-LINK] Added {result['memory_id']} to similar_memories")
+                else:
+                    logger.info(f"[AUTO-LINK] Filtered out self-reference")
 
-                if similar_memories:
-                    # Auto-link: populate related_memories field with similar memory IDs
-                    memory.related_memories = [m['id'] for m in similar_memories]
-                    logger.info(f"Similar memories found and linked: {memory.related_memories}")
-            except Exception as e:
-                logger.warning(f"Similarity search failed (non-fatal): {e}")
+            similarity_time = (time.perf_counter() - similarity_start) * 1000
+            logger.info(f"[TIMING] Similarity search found {len(similar_memories)} similar memories in {similarity_time:.2f}ms")
+
+            if similar_memories:
+                # Auto-link: populate related_memories field with similar memory IDs
+                memory.related_memories = [m['id'] for m in similar_memories]
+                logger.info(f"Similar memories found and linked: {memory.related_memories}")
+            else:
+                logger.info(f"[AUTO-LINK] No similar memories after filtering (all were self-references)")
+        except Exception as e:
+            logger.warning(f"Similarity search failed (non-fatal): {e}")
 
         if is_update and old_hash:
             new_hash = memory.content_hash()
@@ -1378,9 +1386,9 @@ class MemoryStore:
             search_filter = Filter(must=filter_conditions) if filter_conditions else None
 
             results = await asyncio.to_thread(
-                self.qdrant_client.search,
+                self.qdrant_client.query_points,
                 collection_name=self.collection_name,
-                query_vector=query_vector,
+                query=query_vector,
                 limit=limit,
                 query_filter=search_filter,
                 with_payload=True,
@@ -2768,7 +2776,7 @@ class MemoryStore:
                 cursor = self.db_conn.execute(
                     """
                     SELECT id, content, category, importance, tags, metadata,
-                           created_at, updated_at, last_accessed, access_count
+                           created_at, updated_at, last_accessed, access_count, related_memories
                     FROM memories
                     WHERE id = ?
                     """,
@@ -2791,6 +2799,7 @@ class MemoryStore:
                     "updated_at": row["updated_at"],
                     "last_accessed": row["last_accessed"],
                     "access_count": row["access_count"],
+                    "related_memories": json.loads(row["related_memories"]) if row["related_memories"] else [],
                 }
 
                 # Get version count
@@ -4234,6 +4243,11 @@ async def handle_call_tool(name: str, arguments: dict) -> list[TextContent]:
                 text += "\nMETADATA:\n"
                 text += "-" * 80 + "\n"
                 text += json.dumps(result['metadata'], indent=2) + "\n"
+
+            if result.get('related_memories'):
+                text += "\nRELATED MEMORIES:\n"
+                text += "-" * 80 + "\n"
+                text += f"{len(result['related_memories'])} connections: {result['related_memories']}\n"
 
             return [TextContent(type="text", text=text)]
 
