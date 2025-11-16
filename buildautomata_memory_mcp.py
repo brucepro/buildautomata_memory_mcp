@@ -1532,13 +1532,13 @@ class MemoryStore:
             updated_at=row["updated_at"],
             access_count=row["access_count"],
             last_accessed=row["last_accessed"],
-            valid_from=row.get("valid_from"),
-            valid_until=row.get("valid_until"),
+            valid_from=row["valid_from"] if "valid_from" in row.keys() else None,
+            valid_until=row["valid_until"] if "valid_until" in row.keys() else None,
             decay_rate=row["decay_rate"],
             version_count=row["version_count"] if "version_count" in row.keys() else 1,
-            memory_type=row.get("memory_type", "episodic"),
-            session_id=row.get("session_id"),
-            task_context=row.get("task_context"),
+            memory_type=row["memory_type"] if "memory_type" in row.keys() else "episodic",
+            session_id=row["session_id"] if "session_id" in row.keys() else None,
+            task_context=row["task_context"] if "task_context" in row.keys() else None,
             provenance=provenance,
             relationships=relationships,
             related_memories=related_memories,
@@ -3084,6 +3084,296 @@ class MemoryStore:
             self._log_error("get_timeline", e)
             return {"error": str(e)}
 
+    async def traverse_graph(
+        self,
+        start_memory_id: str,
+        depth: int = 2,
+        max_nodes: int = 50,
+        min_importance: float = 0.0,
+        category_filter: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Traverse memory graph N hops from starting node.
+
+        Returns subgraph showing connections between memories - useful for AI
+        to understand how concepts relate and build context from neighborhoods.
+        """
+        if depth < 1 or depth > 5:
+            return {"error": "depth must be between 1 and 5"}
+
+        visited = set()
+        nodes = {}
+        edges = []
+
+        async def traverse_level(memory_ids: List[str], current_depth: int):
+            if current_depth > depth or len(nodes) >= max_nodes:
+                return
+
+            next_level = []
+            for mem_id in memory_ids:
+                if mem_id in visited or len(nodes) >= max_nodes:
+                    continue
+
+                visited.add(mem_id)
+
+                # Get memory details
+                mem_result = await self.get_memory_by_id(mem_id)
+                if "error" in mem_result:
+                    continue
+
+                # Filter by importance and category
+                if mem_result["importance"] < min_importance:
+                    continue
+                if category_filter and mem_result["category"] != category_filter:
+                    continue
+
+                # Add to nodes
+                nodes[mem_id] = {
+                    "id": mem_id,
+                    "content_preview": mem_result["content"][:150] + "..." if len(mem_result["content"]) > 150 else mem_result["content"],
+                    "category": mem_result["category"],
+                    "importance": mem_result["importance"],
+                    "tags": mem_result["tags"],
+                    "created_at": mem_result["created_at"],
+                    "depth": current_depth
+                }
+
+                # Add edges to related memories
+                if mem_result.get("related_memories"):
+                    for related_id in mem_result["related_memories"]:
+                        if isinstance(related_id, dict):
+                            related_id = related_id.get("id")
+                        if related_id:
+                            edges.append({
+                                "source": mem_id,
+                                "target": related_id,
+                                "type": "related"
+                            })
+                            next_level.append(related_id)
+
+            if next_level and current_depth < depth:
+                await traverse_level(next_level, current_depth + 1)
+
+        await traverse_level([start_memory_id], 1)
+
+        return {
+            "start_node": start_memory_id,
+            "depth": depth,
+            "node_count": len(nodes),
+            "edge_count": len(edges),
+            "nodes": list(nodes.values()),
+            "edges": edges,
+            "truncated": len(nodes) >= max_nodes
+        }
+
+    async def find_clusters(
+        self,
+        min_cluster_size: int = 3,
+        min_importance: float = 0.5,
+        limit: int = 10
+    ) -> Dict[str, Any]:
+        """Identify densely connected regions in memory graph.
+
+        Finds clusters of related memories - helps AI discover thematic
+        groups and understand which concepts form coherent knowledge areas.
+        """
+        if not self.db_conn:
+            return {"error": "Database not available"}
+
+        try:
+            # Get high-importance memories with related_memories
+            with self._db_lock:
+                cursor = self.db_conn.execute(
+                    """
+                    SELECT id, content, category, importance, tags, related_memories, created_at
+                    FROM memories
+                    WHERE importance >= ?
+                    ORDER BY importance DESC
+                    LIMIT 200
+                    """,
+                    (min_importance,)
+                )
+                rows = cursor.fetchall()
+
+            # Build adjacency graph
+            graph = {}  # memory_id -> set of connected memory_ids
+            memory_data = {}  # memory_id -> memory info
+
+            for row in rows:
+                mem_id = row["id"]
+                related = json.loads(row["related_memories"]) if row["related_memories"] else []
+
+                # Handle both list of IDs and list of dicts
+                related_ids = []
+                for r in related:
+                    if isinstance(r, dict):
+                        related_ids.append(r.get("id"))
+                    else:
+                        related_ids.append(r)
+
+                graph[mem_id] = set(r for r in related_ids if r)
+                memory_data[mem_id] = {
+                    "id": mem_id,
+                    "content_preview": row["content"][:100] + "..." if len(row["content"]) > 100 else row["content"],
+                    "category": row["category"],
+                    "importance": row["importance"],
+                    "tags": json.loads(row["tags"]) if row["tags"] else [],
+                    "created_at": row["created_at"]
+                }
+
+            # Find connected components (clusters)
+            visited = set()
+            clusters = []
+
+            def dfs(node, cluster):
+                if node in visited or node not in graph:
+                    return
+                visited.add(node)
+                cluster.add(node)
+                for neighbor in graph.get(node, set()):
+                    if neighbor not in visited:
+                        dfs(neighbor, cluster)
+
+            for node in graph:
+                if node not in visited:
+                    cluster = set()
+                    dfs(node, cluster)
+                    if len(cluster) >= min_cluster_size:
+                        clusters.append(cluster)
+
+            # Sort clusters by size and importance
+            cluster_results = []
+            for cluster in sorted(clusters, key=len, reverse=True)[:limit]:
+                cluster_mems = [memory_data[mem_id] for mem_id in cluster if mem_id in memory_data]
+                avg_importance = sum(m["importance"] for m in cluster_mems) / len(cluster_mems)
+
+                # Extract common tags and categories
+                all_tags = []
+                categories = {}
+                for m in cluster_mems:
+                    all_tags.extend(m["tags"])
+                    cat = m["category"]
+                    categories[cat] = categories.get(cat, 0) + 1
+
+                from collections import Counter
+                common_tags = [tag for tag, count in Counter(all_tags).most_common(5)]
+                dominant_category = max(categories.items(), key=lambda x: x[1])[0] if categories else None
+
+                cluster_results.append({
+                    "size": len(cluster),
+                    "avg_importance": round(avg_importance, 3),
+                    "dominant_category": dominant_category,
+                    "common_tags": common_tags,
+                    "memory_ids": list(cluster),
+                    "sample_memories": cluster_mems[:5]  # Show first 5 as examples
+                })
+
+            return {
+                "total_memories_analyzed": len(rows),
+                "clusters_found": len(cluster_results),
+                "clusters": cluster_results
+            }
+
+        except Exception as e:
+            logger.error(f"Cluster detection failed: {e}")
+            logger.error(traceback.format_exc())
+            return {"error": str(e)}
+
+    async def get_graph_statistics(
+        self,
+        category: Optional[str] = None,
+        min_importance: float = 0.0
+    ) -> Dict[str, Any]:
+        """Get graph connectivity statistics.
+
+        Shows which memories are most connected, isolated nodes, avg connections -
+        helps AI understand memory network structure and find central concepts.
+        """
+        if not self.db_conn:
+            return {"error": "Database not available"}
+
+        try:
+            # Get memories with filters
+            query = "SELECT id, category, importance, related_memories FROM memories WHERE importance >= ?"
+            params = [min_importance]
+
+            if category:
+                query += " AND category = ?"
+                params.append(category)
+
+            with self._db_lock:
+                cursor = self.db_conn.execute(query, params)
+                rows = cursor.fetchall()
+
+            # Calculate connectivity metrics
+            connection_counts = {}
+            total_connections = 0
+            isolated_nodes = []
+
+            for row in rows:
+                mem_id = row["id"]
+                related = json.loads(row["related_memories"]) if row["related_memories"] else []
+
+                # Handle both list of IDs and list of dicts
+                related_ids = []
+                for r in related:
+                    if isinstance(r, dict):
+                        related_ids.append(r.get("id"))
+                    else:
+                        related_ids.append(r)
+
+                connection_count = len([r for r in related_ids if r])
+                connection_counts[mem_id] = connection_count
+                total_connections += connection_count
+
+                if connection_count == 0:
+                    isolated_nodes.append({
+                        "id": mem_id,
+                        "category": row["category"],
+                        "importance": row["importance"]
+                    })
+
+            # Find most connected nodes (hubs)
+            hubs = sorted(
+                [(mem_id, count) for mem_id, count in connection_counts.items()],
+                key=lambda x: x[1],
+                reverse=True
+            )[:10]
+
+            # Get details for hubs
+            hub_details = []
+            for mem_id, count in hubs:
+                mem_result = await self.get_memory_by_id(mem_id)
+                if "error" not in mem_result:
+                    hub_details.append({
+                        "id": mem_id,
+                        "connections": count,
+                        "category": mem_result["category"],
+                        "importance": mem_result["importance"],
+                        "content_preview": mem_result["content"][:100] + "..." if len(mem_result["content"]) > 100 else mem_result["content"]
+                    })
+
+            avg_connections = total_connections / len(rows) if rows else 0
+
+            return {
+                "total_memories": len(rows),
+                "total_connections": total_connections,
+                "avg_connections_per_memory": round(avg_connections, 2),
+                "isolated_nodes_count": len(isolated_nodes),
+                "isolated_nodes": isolated_nodes[:20],  # Sample
+                "most_connected_hubs": hub_details,
+                "connectivity_distribution": {
+                    "no_connections": len([c for c in connection_counts.values() if c == 0]),
+                    "1-3_connections": len([c for c in connection_counts.values() if 1 <= c <= 3]),
+                    "4-10_connections": len([c for c in connection_counts.values() if 4 <= c <= 10]),
+                    "10+_connections": len([c for c in connection_counts.values() if c > 10])
+                }
+            }
+
+        except Exception as e:
+            logger.error(f"Graph statistics failed: {e}")
+            logger.error(traceback.format_exc())
+            return {"error": str(e)}
+
     def get_statistics(self) -> Dict[str, Any]:
         """Get system statistics with cache memory estimates"""
         stats = {
@@ -3585,6 +3875,83 @@ async def handle_list_tools() -> list[Tool]:
                     },
                 },
                 "required": ["memory_ids"],
+            },
+        ),
+        Tool(
+            name="traverse_memory_graph",
+            description="Traverse memory graph N hops from starting node. Returns subgraph showing connections - helps AI understand how concepts relate and build context from memory neighborhoods. More useful than individual search when exploring relationships.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "start_memory_id": {
+                        "type": "string",
+                        "description": "Memory ID to start traversal from",
+                    },
+                    "depth": {
+                        "type": "integer",
+                        "description": "How many hops to traverse (1-5, default 2)",
+                        "default": 2,
+                    },
+                    "max_nodes": {
+                        "type": "integer",
+                        "description": "Maximum nodes to return (default 50)",
+                        "default": 50,
+                    },
+                    "min_importance": {
+                        "type": "number",
+                        "description": "Minimum importance filter (0.0-1.0, default 0.0)",
+                        "default": 0.0,
+                    },
+                    "category_filter": {
+                        "type": "string",
+                        "description": "Only include memories from this category",
+                    },
+                },
+                "required": ["start_memory_id"],
+            },
+        ),
+        Tool(
+            name="find_memory_clusters",
+            description="Find densely connected regions in memory graph. Discovers thematic groups and coherent knowledge areas - helps AI understand which concepts naturally cluster together. Better than category browsing for finding emergent structure.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "min_cluster_size": {
+                        "type": "integer",
+                        "description": "Minimum memories in a cluster (default 3)",
+                        "default": 3,
+                    },
+                    "min_importance": {
+                        "type": "number",
+                        "description": "Minimum importance to consider (default 0.5)",
+                        "default": 0.5,
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum clusters to return (default 10)",
+                        "default": 10,
+                    },
+                },
+                "required": [],
+            },
+        ),
+        Tool(
+            name="get_memory_graph_stats",
+            description="Get graph connectivity statistics - shows most connected memories (hubs), isolated nodes, average connections, connectivity distribution. Helps AI understand memory network structure and find central concepts that bridge knowledge areas.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "category": {
+                        "type": "string",
+                        "description": "Filter to specific category",
+                    },
+                    "min_importance": {
+                        "type": "number",
+                        "description": "Minimum importance (default 0.0)",
+                        "default": 0.0,
+                    },
+                },
+                "required": [],
             },
         ),
     ]
@@ -4311,6 +4678,109 @@ async def handle_call_tool(name: str, arguments: dict) -> list[TextContent]:
             min_age_days = arguments.get("min_age_days", 7)
             result = await memory_store.get_least_accessed_memories(limit=limit, min_age_days=min_age_days)
             return [TextContent(type="text", text=result)]
+
+        elif name == "traverse_memory_graph":
+            logger.info(f"Traversing memory graph from {arguments['start_memory_id']}")
+            result = await memory_store.traverse_graph(
+                start_memory_id=arguments["start_memory_id"],
+                depth=arguments.get("depth", 2),
+                max_nodes=arguments.get("max_nodes", 50),
+                min_importance=arguments.get("min_importance", 0.0),
+                category_filter=arguments.get("category_filter")
+            )
+
+            if "error" in result:
+                return [TextContent(type="text", text=f"Error: {result['error']}")]
+
+            text = f"=== MEMORY GRAPH TRAVERSAL ===\n"
+            text += f"Start: {result['start_node']}\n"
+            text += f"Depth: {result['depth']} hops\n"
+            text += f"Found: {result['node_count']} nodes, {result['edge_count']} edges\n"
+            if result.get('truncated'):
+                text += f"⚠ Truncated at {result['max_nodes']} nodes limit\n"
+            text += "\n"
+
+            # Group nodes by depth
+            by_depth = {}
+            for node in result['nodes']:
+                depth = node['depth']
+                if depth not in by_depth:
+                    by_depth[depth] = []
+                by_depth[depth].append(node)
+
+            for depth in sorted(by_depth.keys()):
+                text += f"DEPTH {depth} ({len(by_depth[depth])} nodes):\n"
+                for node in by_depth[depth][:5]:  # Show first 5 per level
+                    text += f"  • [{node['category']}] {node['content_preview']}\n"
+                    text += f"    ID: {node['id']} | importance: {node['importance']}\n"
+                if len(by_depth[depth]) > 5:
+                    text += f"  ... and {len(by_depth[depth]) - 5} more\n"
+                text += "\n"
+
+            return [TextContent(type="text", text=text)]
+
+        elif name == "find_memory_clusters":
+            logger.info("Finding memory clusters")
+            result = await memory_store.find_clusters(
+                min_cluster_size=arguments.get("min_cluster_size", 3),
+                min_importance=arguments.get("min_importance", 0.5),
+                limit=arguments.get("limit", 10)
+            )
+
+            if "error" in result:
+                return [TextContent(type="text", text=f"Error: {result['error']}")]
+
+            text = f"=== MEMORY CLUSTERS ===\n"
+            text += f"Analyzed: {result['total_memories_analyzed']} memories\n"
+            text += f"Found: {result['clusters_found']} clusters\n\n"
+
+            for i, cluster in enumerate(result['clusters'], 1):
+                text += f"CLUSTER {i}: {cluster['size']} memories\n"
+                text += f"  Category: {cluster['dominant_category']}\n"
+                text += f"  Avg Importance: {cluster['avg_importance']}\n"
+                text += f"  Common Tags: {', '.join(cluster['common_tags'][:5])}\n"
+                text += f"  Sample memories:\n"
+                for mem in cluster['sample_memories']:
+                    text += f"    • {mem['content_preview']}\n"
+                text += "\n"
+
+            return [TextContent(type="text", text=text)]
+
+        elif name == "get_memory_graph_stats":
+            logger.info("Getting memory graph statistics")
+            result = await memory_store.get_graph_statistics(
+                category=arguments.get("category"),
+                min_importance=arguments.get("min_importance", 0.0)
+            )
+
+            if "error" in result:
+                return [TextContent(type="text", text=f"Error: {result['error']}")]
+
+            text = f"=== MEMORY GRAPH STATISTICS ===\n"
+            text += f"Total Memories: {result['total_memories']}\n"
+            text += f"Total Connections: {result['total_connections']}\n"
+            text += f"Avg Connections: {result['avg_connections_per_memory']}\n"
+            text += f"Isolated Nodes: {result['isolated_nodes_count']}\n\n"
+
+            text += "CONNECTIVITY DISTRIBUTION:\n"
+            dist = result['connectivity_distribution']
+            text += f"  No connections: {dist['no_connections']}\n"
+            text += f"  1-3 connections: {dist['1-3_connections']}\n"
+            text += f"  4-10 connections: {dist['4-10_connections']}\n"
+            text += f"  10+ connections: {dist['10+_connections']}\n\n"
+
+            text += "MOST CONNECTED HUBS:\n"
+            for hub in result['most_connected_hubs'][:10]:
+                text += f"  • {hub['connections']} connections - [{hub['category']}] {hub['content_preview']}\n"
+                text += f"    ID: {hub['id']} | importance: {hub['importance']}\n"
+
+            if result['isolated_nodes']:
+                text += f"\nSAMPLE ISOLATED NODES:\n"
+                for node in result['isolated_nodes'][:5]:
+                    text += f"  • [{node['category']}] importance: {node['importance']}\n"
+                    text += f"    ID: {node['id']}\n"
+
+            return [TextContent(type="text", text=text)]
 
         else:
             return [TextContent(type="text", text=f"Unknown tool: {name}")]

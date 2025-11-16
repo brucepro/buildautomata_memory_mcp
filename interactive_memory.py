@@ -271,6 +271,38 @@ class MemoryCLI:
         )
         return result
 
+    async def traverse_graph(self, start_memory_id: str, depth: int = 2,
+                            max_nodes: int = 50, min_importance: float = 0.0,
+                            category_filter: str = None) -> dict:
+        """Traverse memory graph N hops from starting node"""
+        result = await self.memory_store.traverse_graph(
+            start_memory_id=start_memory_id,
+            depth=depth,
+            max_nodes=max_nodes,
+            min_importance=min_importance,
+            category_filter=category_filter
+        )
+        return result
+
+    async def find_clusters(self, min_cluster_size: int = 3,
+                           min_importance: float = 0.5, limit: int = 10) -> dict:
+        """Find densely connected regions in memory graph"""
+        result = await self.memory_store.find_clusters(
+            min_cluster_size=min_cluster_size,
+            min_importance=min_importance,
+            limit=limit
+        )
+        return result
+
+    async def graph_stats(self, category: str = None,
+                         min_importance: float = 0.0) -> dict:
+        """Get graph connectivity statistics"""
+        result = await self.memory_store.get_graph_statistics(
+            category=category,
+            min_importance=min_importance
+        )
+        return result
+
     async def shutdown(self):
         """Shutdown the store"""
         await self.memory_store.shutdown()
@@ -508,6 +540,23 @@ Examples:
     consolidate_parser.add_argument("--target-length", type=int, default=500, help="Target length in characters (default: 500)")
     consolidate_parser.add_argument("--new-type", default="semantic", choices=["episodic", "semantic", "working"], help="New memory type (default: semantic)")
 
+    # Graph exploration commands
+    traverse_parser = subparsers.add_parser("traverse-graph", help="Traverse memory graph N hops from starting node")
+    traverse_parser.add_argument("start_memory_id", help="Memory ID to start traversal from")
+    traverse_parser.add_argument("--depth", type=int, default=2, help="Traversal depth in hops (1-5, default: 2)")
+    traverse_parser.add_argument("--max-nodes", type=int, default=50, help="Maximum nodes to return (default: 50)")
+    traverse_parser.add_argument("--min-importance", type=float, default=0.0, help="Minimum importance filter (default: 0.0)")
+    traverse_parser.add_argument("--category", help="Filter by category")
+
+    clusters_parser = subparsers.add_parser("find-clusters", help="Find densely connected regions in memory graph")
+    clusters_parser.add_argument("--min-size", type=int, default=3, help="Minimum cluster size (default: 3)")
+    clusters_parser.add_argument("--min-importance", type=float, default=0.5, help="Minimum importance (default: 0.5)")
+    clusters_parser.add_argument("--limit", type=int, default=10, help="Maximum clusters to return (default: 10)")
+
+    graph_stats_parser = subparsers.add_parser("graph-stats", help="Get graph connectivity statistics")
+    graph_stats_parser.add_argument("--category", help="Filter to specific category")
+    graph_stats_parser.add_argument("--min-importance", type=float, default=0.0, help="Minimum importance (default: 0.0)")
+
     args = parser.parse_args()
 
     if not args.command:
@@ -646,6 +695,28 @@ Examples:
                 consolidation_type=args.consolidation_type,
                 target_length=args.target_length,
                 new_memory_type=args.new_type
+            )
+
+        elif args.command == "traverse-graph":
+            result = await cli.traverse_graph(
+                start_memory_id=args.start_memory_id,
+                depth=args.depth,
+                max_nodes=args.max_nodes,
+                min_importance=args.min_importance,
+                category_filter=args.category
+            )
+
+        elif args.command == "find-clusters":
+            result = await cli.find_clusters(
+                min_cluster_size=args.min_size,
+                min_importance=args.min_importance,
+                limit=args.limit
+            )
+
+        elif args.command == "graph-stats":
+            result = await cli.graph_stats(
+                category=args.category,
+                min_importance=args.min_importance
             )
 
         # Output result
@@ -1080,6 +1151,75 @@ Examples:
                     if result.get('provenance'):
                         print("PROVENANCE:")
                         print(json.dumps(result['provenance'], indent=2))
+
+            elif args.command == "traverse-graph":
+                if "error" in result:
+                    print(f"[ERROR] {result['error']}")
+                else:
+                    print("=" * 80)
+                    print(f"GRAPH TRAVERSAL FROM: {result['start_node']}")
+                    print("=" * 80)
+                    print(f"Depth: {result['depth']} hops")
+                    print(f"Nodes: {result['node_count']}, Edges: {result['edge_count']}")
+                    if result.get('truncated'):
+                        print("⚠ Result truncated at max_nodes limit")
+                    print()
+                    # Group by depth
+                    by_depth = {}
+                    for node in result['nodes']:
+                        depth = node['depth']
+                        by_depth.setdefault(depth, []).append(node)
+                    for depth in sorted(by_depth.keys()):
+                        print(f"DEPTH {depth}: {len(by_depth[depth])} nodes")
+                        for node in by_depth[depth][:5]:
+                            print(f"  [{node['category']}] {node['content_preview']}")
+                            print(f"    ID: {node['id']} | importance: {node['importance']}")
+                        if len(by_depth[depth]) > 5:
+                            print(f"  ... and {len(by_depth[depth]) - 5} more")
+                        print()
+
+            elif args.command == "find-clusters":
+                if "error" in result:
+                    print(f"[ERROR] {result['error']}")
+                else:
+                    print("=" * 80)
+                    print("MEMORY CLUSTERS")
+                    print("=" * 80)
+                    print(f"Analyzed: {result['total_memories_analyzed']} memories")
+                    print(f"Found: {result['clusters_found']} clusters")
+                    print()
+                    for i, cluster in enumerate(result['clusters'], 1):
+                        print(f"CLUSTER {i}: {cluster['size']} memories")
+                        print(f"  Category: {cluster['dominant_category']}")
+                        print(f"  Avg Importance: {cluster['avg_importance']}")
+                        print(f"  Common Tags: {', '.join(cluster['common_tags'][:5])}")
+                        print(f"  Sample memories:")
+                        for mem in cluster['sample_memories'][:3]:
+                            print(f"    • {mem['content_preview']}")
+                        print()
+
+            elif args.command == "graph-stats":
+                if "error" in result:
+                    print(f"[ERROR] {result['error']}")
+                else:
+                    print("=" * 80)
+                    print("MEMORY GRAPH STATISTICS")
+                    print("=" * 80)
+                    print(f"Total Memories: {result['total_memories']}")
+                    print(f"Total Connections: {result['total_connections']}")
+                    print(f"Avg Connections: {result['avg_connections_per_memory']}")
+                    print(f"Isolated Nodes: {result['isolated_nodes_count']}")
+                    print()
+                    print("CONNECTIVITY DISTRIBUTION:")
+                    dist = result['connectivity_distribution']
+                    print(f"  No connections: {dist['no_connections']}")
+                    print(f"  1-3 connections: {dist['1-3_connections']}")
+                    print(f"  4-10 connections: {dist['4-10_connections']}")
+                    print(f"  10+ connections: {dist['10+_connections']}")
+                    print()
+                    print("MOST CONNECTED HUBS:")
+                    for hub in result['most_connected_hubs'][:5]:
+                        print(f"  {hub['connections']} connections - [{hub['category']}] {hub['content_preview'][:60]}")
         else:
             # Compact AI-optimized output (default)
             if args.command == "init":
@@ -1110,6 +1250,29 @@ Examples:
                     print(f"ERROR {result['error']}")
                 else:
                     print(f"CONSOLIDATED new_id={result['new_memory_id']} source_count={len(result['source_memory_ids'])} type={result['consolidation_type']}")
+            elif args.command == "traverse-graph":
+                if "error" in result:
+                    print(f"ERROR {result['error']}")
+                else:
+                    print(f"GRAPH_TRAVERSE start={result['start_node']} depth={result['depth']} nodes={result['node_count']} edges={result['edge_count']} truncated={result.get('truncated', False)}")
+                    for node in result['nodes']:
+                        print(f"NODE id={node['id']} depth={node['depth']} category={node['category']} importance={node['importance']}")
+            elif args.command == "find-clusters":
+                if "error" in result:
+                    print(f"ERROR {result['error']}")
+                else:
+                    print(f"CLUSTERS total={result['total_memories_analyzed']} found={result['clusters_found']}")
+                    for cluster in result['clusters']:
+                        print(f"CLUSTER size={cluster['size']} category={cluster['dominant_category']} avg_importance={cluster['avg_importance']} tags={','.join(cluster['common_tags'][:3])}")
+            elif args.command == "graph-stats":
+                if "error" in result:
+                    print(f"ERROR {result['error']}")
+                else:
+                    print(f"GRAPH_STATS memories={result['total_memories']} connections={result['total_connections']} avg={result['avg_connections_per_memory']} isolated={result['isolated_nodes_count']}")
+                    dist = result['connectivity_distribution']
+                    print(f"DISTRIBUTION none={dist['no_connections']} low={dist['1-3_connections']} med={dist['4-10_connections']} high={dist['10+_connections']}")
+                    for hub in result['most_connected_hubs'][:5]:
+                        print(f"HUB id={hub['id']} connections={hub['connections']} category={hub['category']}")
             else:
                 # Fallback for other commands - use JSON
                 print(json.dumps(result, default=str))

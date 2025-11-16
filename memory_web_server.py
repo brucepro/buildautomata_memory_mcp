@@ -945,6 +945,40 @@ async def list_tools():
                     "target_length": {"type": "integer", "default": 500},
                     "new_memory_type": {"type": "string", "default": "semantic"}
                 }
+            },
+            {
+                "name": "traverse_memory_graph",
+                "description": "Traverse memory graph N hops from starting node. Returns subgraph showing connections between memories for context building.",
+                "endpoint": "/tool/traverse_memory_graph",
+                "method": "GET",
+                "parameters": {
+                    "start_memory_id": {"type": "string", "required": True},
+                    "depth": {"type": "integer", "default": 2, "min": 1, "max": 5},
+                    "max_nodes": {"type": "integer", "default": 50, "min": 1, "max": 200},
+                    "min_importance": {"type": "float", "default": 0.0, "min": 0.0, "max": 1.0},
+                    "category_filter": {"type": "string", "optional": True}
+                }
+            },
+            {
+                "name": "find_memory_clusters",
+                "description": "Find densely connected regions in memory graph. Discovers thematic groups and coherent knowledge areas.",
+                "endpoint": "/tool/find_memory_clusters",
+                "method": "GET",
+                "parameters": {
+                    "min_cluster_size": {"type": "integer", "default": 3, "min": 2},
+                    "min_importance": {"type": "float", "default": 0.5, "min": 0.0, "max": 1.0},
+                    "limit": {"type": "integer", "default": 10, "min": 1, "max": 50}
+                }
+            },
+            {
+                "name": "get_memory_graph_stats",
+                "description": "Get graph connectivity statistics - shows hubs, isolated nodes, connectivity distribution. Helps understand memory network structure.",
+                "endpoint": "/tool/get_memory_graph_stats",
+                "method": "GET",
+                "parameters": {
+                    "category": {"type": "string", "optional": True},
+                    "min_importance": {"type": "float", "default": 0.0, "min": 0.0, "max": 1.0}
+                }
             }
         ]
     }
@@ -1132,6 +1166,68 @@ async def prune_old_memories(
     try:
         store = get_memory_store()
         result = await store.prune_old_memories(max_memories=max_memories, dry_run=dry_run)
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/tool/traverse_memory_graph")
+@app.get("/api/graph/traverse/{start_memory_id}")
+async def traverse_memory_graph(
+    start_memory_id: str,
+    depth: int = Query(2, ge=1, le=5, description="Traversal depth (1-5 hops)"),
+    max_nodes: int = Query(50, ge=1, le=200, description="Maximum nodes to return"),
+    min_importance: float = Query(0.0, ge=0.0, le=1.0, description="Minimum importance filter"),
+    category_filter: Optional[str] = Query(None, description="Filter by category")
+):
+    """Traverse memory graph N hops from starting node. Returns subgraph showing connections."""
+    try:
+        store = get_memory_store()
+        result = await store.traverse_graph(
+            start_memory_id=start_memory_id,
+            depth=depth,
+            max_nodes=max_nodes,
+            min_importance=min_importance,
+            category_filter=category_filter
+        )
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/tool/find_memory_clusters")
+@app.get("/api/graph/clusters")
+async def find_memory_clusters(
+    min_cluster_size: int = Query(3, ge=2, description="Minimum memories in a cluster"),
+    min_importance: float = Query(0.5, ge=0.0, le=1.0, description="Minimum importance"),
+    limit: int = Query(10, ge=1, le=50, description="Maximum clusters to return")
+):
+    """Find densely connected regions in memory graph. Discovers thematic groups."""
+    try:
+        store = get_memory_store()
+        result = await store.find_clusters(
+            min_cluster_size=min_cluster_size,
+            min_importance=min_importance,
+            limit=limit
+        )
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/tool/get_memory_graph_stats")
+@app.get("/api/graph/stats")
+async def get_memory_graph_stats(
+    category: Optional[str] = Query(None, description="Filter to specific category"),
+    min_importance: float = Query(0.0, ge=0.0, le=1.0, description="Minimum importance")
+):
+    """Get graph connectivity statistics - hubs, isolated nodes, connectivity distribution."""
+    try:
+        store = get_memory_store()
+        result = await store.get_graph_statistics(
+            category=category,
+            min_importance=min_importance
+        )
         return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
