@@ -1,0 +1,577 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Memory Graph Visualization</title>
+    <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            background: #0a0e27;
+            color: #e5e7eb;
+            overflow: hidden;
+        }
+
+        .container {
+            display: grid;
+            grid-template-columns: 280px 1fr 320px;
+            grid-template-rows: 60px 1fr;
+            height: 100vh;
+        }
+
+        .header {
+            grid-column: 1 / -1;
+            background: #1e293b;
+            border-bottom: 1px solid #2d3748;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 0 20px;
+        }
+
+        .header h1 {
+            font-size: 18px;
+            font-weight: 600;
+            color: #f3f4f6;
+        }
+
+        .header-controls {
+            display: flex;
+            gap: 12px;
+        }
+
+        .search-box {
+            position: relative;
+        }
+
+        .search-box input {
+            background: #0a0e27;
+            border: 1px solid #2d3748;
+            border-radius: 6px;
+            padding: 8px 12px;
+            color: #e5e7eb;
+            width: 250px;
+            font-size: 14px;
+        }
+
+        .search-box input:focus {
+            outline: none;
+            border-color: #00d9ff;
+        }
+
+        .sidebar {
+            background: #1e293b;
+            border-right: 1px solid #2d3748;
+            padding: 20px;
+            overflow-y: auto;
+        }
+
+        .sidebar h2 {
+            font-size: 14px;
+            font-weight: 600;
+            color: #9ca3af;
+            text-transform: uppercase;
+            margin-bottom: 16px;
+            letter-spacing: 0.5px;
+        }
+
+        .control-group {
+            margin-bottom: 24px;
+        }
+
+        .control-group label {
+            display: block;
+            font-size: 13px;
+            color: #9ca3af;
+            margin-bottom: 8px;
+        }
+
+        select, input[type="range"] {
+            width: 100%;
+            background: #0a0e27;
+            border: 1px solid #2d3748;
+            border-radius: 4px;
+            padding: 8px;
+            color: #e5e7eb;
+            font-size: 13px;
+        }
+
+        input[type="range"] {
+            padding: 0;
+            height: 6px;
+            background: #2d3748;
+            outline: none;
+            -webkit-appearance: none;
+        }
+
+        input[type="range"]::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            width: 16px;
+            height: 16px;
+            background: #00d9ff;
+            cursor: pointer;
+            border-radius: 50%;
+        }
+
+        .range-value {
+            display: block;
+            text-align: right;
+            font-size: 12px;
+            color: #00d9ff;
+            margin-top: 4px;
+        }
+
+        .stats-box {
+            background: #0a0e27;
+            border: 1px solid #2d3748;
+            border-radius: 6px;
+            padding: 12px;
+            margin-bottom: 16px;
+        }
+
+        .stat-row {
+            display: flex;
+            justify-content: space-between;
+            padding: 6px 0;
+            font-size: 13px;
+        }
+
+        .stat-label {
+            color: #9ca3af;
+        }
+
+        .stat-value {
+            color: #f3f4f6;
+            font-weight: 500;
+        }
+
+        .graph-container {
+            position: relative;
+            background: #0a0e27;
+        }
+
+        #graph {
+            width: 100%;
+            height: 100%;
+        }
+
+        .detail-panel {
+            background: #1e293b;
+            border-left: 1px solid #2d3748;
+            overflow-y: auto;
+            padding: 20px;
+            display: none;
+        }
+
+        .detail-panel.active {
+            display: block;
+        }
+
+        .detail-panel h2 {
+            font-size: 16px;
+            color: #f3f4f6;
+            margin-bottom: 16px;
+        }
+
+        .detail-meta {
+            background: #0a0e27;
+            border: 1px solid #2d3748;
+            border-radius: 6px;
+            padding: 12px;
+            margin-bottom: 16px;
+            font-size: 13px;
+        }
+
+        .detail-meta div {
+            padding: 4px 0;
+        }
+
+        .detail-content {
+            background: #0a0e27;
+            border: 1px solid #2d3748;
+            border-radius: 6px;
+            padding: 16px;
+            font-size: 13px;
+            line-height: 1.6;
+            white-space: pre-wrap;
+            max-height: 400px;
+            overflow-y: auto;
+        }
+
+        .connected-memories {
+            margin-top: 16px;
+        }
+
+        .connected-memory {
+            background: #0a0e27;
+            border: 1px solid #2d3748;
+            border-radius: 4px;
+            padding: 10px;
+            margin-bottom: 8px;
+            font-size: 12px;
+            cursor: pointer;
+            transition: border-color 0.2s;
+        }
+
+        .connected-memory:hover {
+            border-color: #00d9ff;
+        }
+
+        .close-detail {
+            float: right;
+            cursor: pointer;
+            color: #9ca3af;
+            font-size: 20px;
+        }
+
+        .close-detail:hover {
+            color: #f3f4f6;
+        }
+
+        .preset-buttons {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 8px;
+            margin-top: 8px;
+        }
+
+        .preset-btn {
+            background: #0a0e27;
+            border: 1px solid #2d3748;
+            border-radius: 4px;
+            padding: 8px;
+            color: #9ca3af;
+            font-size: 12px;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        .preset-btn:hover {
+            background: #2d3748;
+            color: #f3f4f6;
+        }
+
+        .loading {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            color: #00d9ff;
+            font-size: 16px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🧠 Memory Graph Visualization</h1>
+            <div class="header-controls">
+                <div class="search-box">
+                    <input type="text" id="search-input" placeholder="Search memories...">
+                </div>
+            </div>
+        </div>
+
+        <div class="sidebar">
+            <h2>Controls</h2>
+
+            <div class="stats-box">
+                <div class="stat-row">
+                    <span class="stat-label">Total Memories</span>
+                    <span class="stat-value">{{ stats.total_memories }}</span>
+                </div>
+                <div class="stat-row">
+                    <span class="stat-label">Connections</span>
+                    <span class="stat-value">{{ stats.num_edges }}</span>
+                </div>
+                <div class="stat-row">
+                    <span class="stat-label">Avg Connections</span>
+                    <span class="stat-value">{{ "%.2f"|format(stats.avg_connections) }}</span>
+                </div>
+                <div class="stat-row">
+                    <span class="stat-label">Categories</span>
+                    <span class="stat-value">{{ stats.num_categories }}</span>
+                </div>
+            </div>
+
+            <div class="control-group">
+                <label for="category-filter">Category</label>
+                <select id="category-filter">
+                    <option value="all">All Categories</option>
+                    {% for cat in categories %}
+                    <option value="{{ cat }}">{{ cat }}</option>
+                    {% endfor %}
+                </select>
+            </div>
+
+            <div class="control-group">
+                <label for="importance-slider">
+                    Min Importance
+                    <span class="range-value" id="importance-value">0.0</span>
+                </label>
+                <input type="range" id="importance-slider" min="0" max="1" step="0.05" value="0">
+            </div>
+
+            <div class="control-group">
+                <label for="connection-slider">
+                    Connection Threshold
+                    <span class="range-value" id="connection-value">1</span>
+                </label>
+                <input type="range" id="connection-slider" min="0" max="10" step="1" value="1">
+            </div>
+
+            <div class="control-group">
+                <label>
+                    <input type="checkbox" id="glow-checkbox" checked>
+                    Highlight High-Access Nodes
+                </label>
+            </div>
+
+            <h2 style="margin-top: 24px;">Advanced</h2>
+
+            <div class="control-group">
+                <label for="layout-mode">Layout Mode</label>
+                <select id="layout-mode">
+                    <option value="force">Force-Directed</option>
+                    <option value="temporal">Temporal (Timeline)</option>
+                    <option value="cluster">Cluster (Communities)</option>
+                </select>
+            </div>
+
+            <div class="control-group">
+                <label for="color-mode">Color Mode</label>
+                <select id="color-mode">
+                    <option value="category">By Category</option>
+                    <option value="community">By Community</option>
+                </select>
+            </div>
+
+            <div class="control-group">
+                <label>
+                    <input type="checkbox" id="particles-checkbox">
+                    Show Particle Effects
+                </label>
+            </div>
+
+            <div class="control-group">
+                <label>Path Finder</label>
+                <input type="text" id="path-source" placeholder="Source node ID" style="margin-bottom: 8px; width: 100%; padding: 6px; font-size: 12px; background: #0a0e27; border: 1px solid #2d3748; border-radius: 4px; color: #e5e7eb;">
+                <input type="text" id="path-target" placeholder="Target node ID" style="margin-bottom: 8px; width: 100%; padding: 6px; font-size: 12px; background: #0a0e27; border: 1px solid #2d3748; border-radius: 4px; color: #e5e7eb;">
+                <button class="preset-btn" onclick="findPath()" style="width: 100%;">Find Shortest Path</button>
+                <div id="path-result" style="margin-top: 8px; font-size: 12px; color: #00d9ff;"></div>
+            </div>
+
+            <div class="control-group">
+                <label>Camera Presets</label>
+                <div class="preset-buttons">
+                    <button class="preset-btn" onclick="resetCamera()">Overview</button>
+                    <button class="preset-btn" onclick="topView()">Top View</button>
+                    <button class="preset-btn" onclick="sideView()">Side View</button>
+                    <button class="preset-btn" onclick="frontView()">Front View</button>
+                </div>
+            </div>
+        </div>
+
+        <div class="graph-container">
+            <div id="graph"></div>
+        </div>
+
+        <div class="detail-panel" id="detail-panel">
+            <span class="close-detail" onclick="closeDetail()">&times;</span>
+            <div id="detail-content"></div>
+        </div>
+    </div>
+
+    <script>
+        // Initial graph data
+        let graphData = {{ graph_json | safe }};
+        let currentGraph = graphData;
+
+        // Render initial graph
+        Plotly.newPlot('graph', graphData.data, graphData.layout, {responsive: true});
+
+        // Handle node clicks
+        document.getElementById('graph').on('plotly_click', function(data) {
+            if (data.points && data.points.length > 0) {
+                const nodeId = data.points[0].customdata;
+                showMemoryDetail(nodeId);
+            }
+        });
+
+        // Update visualization
+        async function updateVisualization() {
+            const category = document.getElementById('category-filter').value;
+            const importance = parseFloat(document.getElementById('importance-slider').value);
+            const connection = parseInt(document.getElementById('connection-slider').value);
+            const showGlow = document.getElementById('glow-checkbox').checked;
+            const layoutMode = document.getElementById('layout-mode').value;
+            const colorMode = document.getElementById('color-mode').value;
+            const showParticles = document.getElementById('particles-checkbox').checked;
+
+            const params = new URLSearchParams({
+                category: category,
+                importance_threshold: importance,
+                connection_threshold: connection,
+                show_high_access_glow: showGlow,
+                layout_mode: layoutMode,
+                color_mode: colorMode,
+                show_particles: showParticles
+            });
+
+            const response = await fetch(`/api/update_visualization?${params}`);
+            const data = await response.json();
+
+            Plotly.react('graph', data.data, data.layout);
+        }
+
+        // Show memory detail
+        async function showMemoryDetail(memoryId) {
+            const response = await fetch(`/api/memory/${memoryId}`);
+            const memory = await response.json();
+
+            const connectedHtml = memory.connected_memories.map(m =>
+                `<div class="connected-memory" onclick="showMemoryDetail('${m.id}')">
+                    <strong>${m.category}</strong> (${m.importance.toFixed(2)})<br>
+                    ${m.preview}
+                </div>`
+            ).join('');
+
+            document.getElementById('detail-content').innerHTML = `
+                <h2>${memory.category}</h2>
+                <div class="detail-meta">
+                    <div><strong>Importance:</strong> ${memory.importance.toFixed(2)}</div>
+                    <div><strong>Connections:</strong> ${memory.connections}</div>
+                    <div><strong>Access Count:</strong> ${memory.access_count}</div>
+                    <div><strong>Created:</strong> ${memory.created_at.substring(0, 10)}</div>
+                    <div><strong>Tags:</strong> ${memory.tags.join(', ')}</div>
+                </div>
+                <div class="detail-content">${memory.content}</div>
+                ${connectedHtml ? `
+                    <div class="connected-memories">
+                        <h3 style="font-size: 14px; margin-bottom: 12px;">Connected Memories (${memory.connected_memories.length})</h3>
+                        ${connectedHtml}
+                    </div>
+                ` : ''}
+            `;
+
+            document.getElementById('detail-panel').classList.add('active');
+        }
+
+        function closeDetail() {
+            document.getElementById('detail-panel').classList.remove('active');
+        }
+
+        // Path finding
+        async function findPath() {
+            const source = document.getElementById('path-source').value.trim();
+            const target = document.getElementById('path-target').value.trim();
+            const resultDiv = document.getElementById('path-result');
+
+            if (!source || !target) {
+                resultDiv.textContent = 'Enter both source and target IDs';
+                return;
+            }
+
+            try {
+                const response = await fetch(`/api/path/${source}/${target}`);
+                if (!response.ok) {
+                    resultDiv.textContent = 'Path not found or invalid IDs';
+                    return;
+                }
+
+                const data = await response.json();
+                if (data.path && data.path.length > 0) {
+                    resultDiv.textContent = `Path length: ${data.path.length} nodes`;
+
+                    // Update visualization to highlight path
+                    const params = new URLSearchParams({
+                        category: document.getElementById('category-filter').value,
+                        importance_threshold: parseFloat(document.getElementById('importance-slider').value),
+                        connection_threshold: parseInt(document.getElementById('connection-slider').value),
+                        show_high_access_glow: document.getElementById('glow-checkbox').checked,
+                        layout_mode: document.getElementById('layout-mode').value,
+                        color_mode: document.getElementById('color-mode').value,
+                        show_particles: document.getElementById('particles-checkbox').checked,
+                        highlight_path: data.path.join(',')
+                    });
+
+                    const vizResponse = await fetch(`/api/update_visualization?${params}`);
+                    const vizData = await vizResponse.json();
+                    Plotly.react('graph', vizData.data, vizData.layout);
+                } else {
+                    resultDiv.textContent = 'No path found';
+                }
+            } catch (error) {
+                resultDiv.textContent = 'Error finding path';
+                console.error(error);
+            }
+        }
+
+        // Camera presets
+        function resetCamera() {
+            Plotly.relayout('graph', {
+                'scene.camera.eye': {x: 1.5, y: 1.5, z: 1.5}
+            });
+        }
+
+        function topView() {
+            Plotly.relayout('graph', {
+                'scene.camera.eye': {x: 0, y: 0, z: 2.5}
+            });
+        }
+
+        function sideView() {
+            Plotly.relayout('graph', {
+                'scene.camera.eye': {x: 2.5, y: 0, z: 0}
+            });
+        }
+
+        function frontView() {
+            Plotly.relayout('graph', {
+                'scene.camera.eye': {x: 0, y: 2.5, z: 0}
+            });
+        }
+
+        // Event listeners
+        document.getElementById('category-filter').addEventListener('change', updateVisualization);
+        document.getElementById('importance-slider').addEventListener('input', function() {
+            document.getElementById('importance-value').textContent = this.value;
+            updateVisualization();
+        });
+        document.getElementById('connection-slider').addEventListener('input', function() {
+            document.getElementById('connection-value').textContent = this.value;
+            updateVisualization();
+        });
+        document.getElementById('glow-checkbox').addEventListener('change', updateVisualization);
+        document.getElementById('layout-mode').addEventListener('change', updateVisualization);
+        document.getElementById('color-mode').addEventListener('change', updateVisualization);
+        document.getElementById('particles-checkbox').addEventListener('change', updateVisualization);
+
+        // Search
+        let searchTimeout;
+        document.getElementById('search-input').addEventListener('input', function() {
+            clearTimeout(searchTimeout);
+            const query = this.value.trim();
+
+            if (query.length < 2) return;
+
+            searchTimeout = setTimeout(async () => {
+                const response = await fetch(`/api/search?query=${encodeURIComponent(query)}`);
+                const data = await response.json();
+
+                if (data.results.length > 0) {
+                    // Highlight first result
+                    showMemoryDetail(data.results[0].id);
+                }
+            }, 300);
+        });
+    </script>
+</body>
+</html>

@@ -377,6 +377,16 @@ def format_compact_init(result: dict) -> str:
                 content = mem.get('content', '').replace('\n', ' ').encode('ascii', 'replace').decode('ascii')
                 lines.append(f"RECENT category={mem.get('category', 'unknown')} content={content}")
 
+    # Working set - show ALL memories with full content (these are critical context)
+    working_set = result.get("working_set", {})
+    if working_set and working_set.get('size', 0) > 0:
+        lines.append(f"WORKING_SET size={working_set['size']}")
+        ws_memories = working_set.get('memories', [])
+        for mem in ws_memories:
+            content = mem.get('content', '').replace('\n', ' ').encode('ascii', 'replace').decode('ascii')
+            score = mem.get('working_set_score', 0)
+            lines.append(f"WS_MEM id={mem.get('id')} category={mem.get('category', 'unknown')} importance={mem.get('importance', 0):.2f} score={score} content={content}")
+
     return '\n'.join(lines)
 
 
@@ -557,6 +567,13 @@ Examples:
     graph_stats_parser.add_argument("--category", help="Filter to specific category")
     graph_stats_parser.add_argument("--min-importance", type=float, default=0.0, help="Minimum importance (default: 0.0)")
 
+    # Command history
+    history_parser = subparsers.add_parser("history", help="Get command history (audit trail)")
+    history_parser.add_argument("--limit", type=int, default=20, help="Max results (default: 20)")
+    history_parser.add_argument("--tool", help="Filter by specific tool name")
+    history_parser.add_argument("--start-date", help="Filter from date (ISO format, e.g. 2025-11-10)")
+    history_parser.add_argument("--end-date", help="Filter to date (ISO format, e.g. 2025-11-20)")
+
     args = parser.parse_args()
 
     if not args.command:
@@ -567,7 +584,7 @@ Examples:
     # Commands that don't need vector search can use lazy loading
     lazy_commands = {"stats", "get", "categories", "tags", "prune", "maintenance",
                      "accessed", "least-accessed", "intention-store", "intention-list",
-                     "intention-update", "get-session", "consolidate"}
+                     "intention-update", "get-session", "consolidate", "history"}
     use_lazy_load = args.command in lazy_commands
 
     # Initialize CLI
@@ -719,6 +736,52 @@ Examples:
                 min_importance=args.min_importance
             )
 
+        elif args.command == "history":
+            result = cli.memory_store.sqlite_store.get_command_history(
+                limit=args.limit,
+                tool_name=args.tool,
+                start_date=args.start_date,
+                end_date=args.end_date
+            )
+
+        # Log command to history (skip history command itself to avoid noise)
+        if args.command != "history" and hasattr(cli.memory_store, 'sqlite_store'):
+            try:
+                # Extract relevant info for logging
+                cmd_args = vars(args).copy()
+                cmd_args.pop('command', None)
+                cmd_args.pop('json', None)
+                cmd_args.pop('pretty', None)
+                cmd_args.pop('human', None)
+                cmd_args.pop('machine', None)
+                cmd_args.pop('username', None)
+                cmd_args.pop('agent', None)
+
+                # Determine memory_id and success from result
+                memory_id = None
+                success = True
+                result_summary = "completed"
+
+                if isinstance(result, dict):
+                    memory_id = result.get('memory_id') or result.get('id')
+                    if 'error' in result:
+                        success = False
+                        result_summary = result['error']
+                    elif 'success' in result:
+                        success = result['success']
+                elif isinstance(result, list):
+                    result_summary = f"returned {len(result)} items"
+
+                cli.memory_store.sqlite_store.log_command(
+                    f"cli_{args.command}",
+                    cmd_args,
+                    result_summary,
+                    memory_id,
+                    success
+                )
+            except Exception as e:
+                pass  # Don't fail command if logging fails
+
         # Output result
         if args.json or args.pretty:
             # JSON output
@@ -773,6 +836,21 @@ Examples:
                         for mem in recent[:3]:
                             content = mem.get('content', '').encode('ascii', 'replace').decode('ascii')
                             print(f"    - [{mem.get('category', 'unknown')}] {content}")
+                    print()
+
+                # Working set - show all with full content and scores
+                working_set = result.get("working_set", {})
+                if working_set and working_set.get('size', 0) > 0:
+                    print(f"WORKING SET ({working_set['size']} memories):")
+                    print(f"  {working_set.get('description', '')}")
+                    ws_memories = working_set.get('memories', [])
+                    if ws_memories:
+                        for i, mem in enumerate(ws_memories, 1):
+                            content = mem.get('content', '').encode('ascii', 'replace').decode('ascii')
+                            score = mem.get('working_set_score', 0)
+                            print(f"  {i}. [{mem.get('category', 'unknown')}] (importance: {mem.get('importance', 0):.2f}, score: {score})")
+                            print(f"     {content}")
+                            print()
                     print()
 
                 # Performance
@@ -937,6 +1015,11 @@ Examples:
                         print("\nMETADATA:")
                         print("-" * 80)
                         print(json.dumps(result['metadata'], indent=2))
+
+                    if result.get('related_memories'):
+                        print("\nRELATED MEMORIES:")
+                        print("-" * 80)
+                        print(f"{len(result['related_memories'])} connections: {result['related_memories']}")
 
             elif args.command == "categories":
                 if "error" in result:

@@ -1,22 +1,18 @@
 #!/usr/bin/env python3
 """
-BuildAutomata Memory Web Server - FIXED VERSION
+BuildAutomata Memory Web Server
 FastAPI server providing web interface to memory operations.
 Enables Claude Code Web instance to access memory storage via localhost.
 
-FIXES:
-- All async methods now properly awaited
-- Memory objects created correctly for store_memory
-- proactive_scan replaced with proper initialization
-- Proper error handling for async operations
 """
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Depends
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, AsyncGenerator
 from datetime import datetime
+from contextlib import asynccontextmanager
 import uvicorn
 import sys
 import os
@@ -44,18 +40,62 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Initialize memory store - HARDCODED USERNAME
-memory_store: Optional[MemoryStore] = None
 
-def get_memory_store() -> MemoryStore:
-    """Get or create memory store instance with hardcoded credentials."""
-    global memory_store
-    if memory_store is None:
-        # Hardcoded to buildautomata_ai_v012/claude_assistant for ease of use
-        username = "buildautomata_ai_v012"
-        agent_name = "claude_assistant"
-        memory_store = MemoryStore(username=username, agent_name=agent_name)
-    return memory_store
+# Command history logging middleware for tool endpoints
+@app.middleware("http")
+async def log_tool_commands(request, call_next):
+    """Log tool endpoint calls to command history"""
+    response = await call_next(request)
+
+    # Only log tool endpoints
+    if request.url.path.startswith("/tool/"):
+        try:
+            tool_name = f"web_{request.url.path.replace('/tool/', '')}"
+            # Create temporary store just for logging
+            temp_store = MemoryStore(username="buildautomata_ai_v012", agent_name="claude_assistant", lazy_load=True)
+            try:
+                # Log with minimal info (can't easily get request body in middleware after call_next)
+                temp_store.sqlite_store.log_command(
+                    tool_name,
+                    {"method": request.method, "path": request.url.path},
+                    f"status_{response.status_code}",
+                    None,
+                    response.status_code < 400
+                )
+            finally:
+                await temp_store.shutdown()
+        except Exception:
+            pass  # Don't fail requests if logging fails
+
+    return response
+
+
+# Configuration - HARDCODED USERNAME
+USERNAME = "buildautomata_ai_v012"
+AGENT_NAME = "claude_assistant"
+
+async def get_memory_store() -> AsyncGenerator[MemoryStore, None]:
+    """
+    Dependency that creates a new memory store instance per request and ensures cleanup.
+
+    IMPORTANT: This creates a NEW instance each time to avoid holding
+    embedded Qdrant lock permanently. Each request gets its own store,
+    initializes, performs operation, then closes via shutdown(). This allows
+    concurrent access from CLI tools and MCP server.
+
+    Previous implementation used global singleton which held Qdrant lock
+    for entire web server lifetime, blocking all other access.
+
+    Usage in endpoints:
+        @app.get("/endpoint")
+        async def handler(store: MemoryStore = Depends(get_memory_store)):
+            ...
+    """
+    store = MemoryStore(username=USERNAME, agent_name=AGENT_NAME)
+    try:
+        yield store
+    finally:
+        await store.shutdown()
 
 
 # Pydantic models for request/response
@@ -82,6 +122,7 @@ class SearchMemoriesRequest(BaseModel):
 class UpdateMemoryRequest(BaseModel):
     memory_id: str = Field(..., description="Memory ID to update")
     content: Optional[str] = Field(default=None, description="New content")
+    category: Optional[str] = Field(default=None, description="New category")
     importance: Optional[float] = Field(default=None, ge=0.0, le=1.0, description="New importance")
     tags: Optional[List[str]] = Field(default=None, description="New tags")
     metadata: Optional[Dict[str, Any]] = Field(default=None, description="New metadata")
@@ -127,426 +168,24 @@ async def root():
     <html>
     <head>
         <title>BuildAutomata Memory</title>
-        <style>
-            body {
-                font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-                max-width: 1400px;
-                margin: 0 auto;
-                padding: 20px;
-                background: #f5f5f5;
-            }
-            h1 { color: #333; border-bottom: 3px solid #4CAF50; padding-bottom: 10px; }
-            h2 { color: #555; margin-top: 30px; }
-            .container { background: white; padding: 20px; border-radius: 8px; margin-bottom: 20px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
-            .form-group { margin-bottom: 15px; }
-            label { display: block; font-weight: bold; margin-bottom: 5px; color: #555; }
-            input[type="text"], input[type="number"], textarea, select {
-                width: 100%;
-                padding: 10px;
-                border: 1px solid #ddd;
-                border-radius: 4px;
-                font-size: 14px;
-                box-sizing: border-box;
-            }
-            textarea { min-height: 100px; font-family: monospace; }
-            button {
-                background: #4CAF50;
-                color: white;
-                padding: 12px 24px;
-                border: none;
-                border-radius: 4px;
-                cursor: pointer;
-                font-size: 14px;
-                font-weight: bold;
-            }
-            button:hover { background: #45a049; }
-            button.secondary { background: #2196F3; }
-            button.secondary:hover { background: #0b7dda; }
-            button.danger { background: #f44336; }
-            button.danger:hover { background: #da190b; }
-            #results {
-                margin-top: 20px;
-                padding: 15px;
-                background: #f9f9f9;
-                border: 1px solid #ddd;
-                border-radius: 4px;
-                font-family: monospace;
-                white-space: pre-wrap;
-                max-height: 600px;
-                overflow-y: auto;
-            }
-            .memory-card {
-                background: white;
-                padding: 15px;
-                margin: 10px 0;
-                border-left: 4px solid #4CAF50;
-                border-radius: 4px;
-                box-shadow: 0 1px 3px rgba(0,0,0,0.1);
-            }
-            .memory-meta {
-                color: #666;
-                font-size: 12px;
-                margin-top: 8px;
-            }
-            .memory-content {
-                margin: 10px 0;
-                color: #333;
-                line-height: 1.6;
-            }
-            .tag {
-                display: inline-block;
-                background: #e3f2fd;
-                color: #1976d2;
-                padding: 3px 8px;
-                border-radius: 3px;
-                font-size: 11px;
-                margin-right: 5px;
-            }
-            .stats-grid {
-                display: grid;
-                grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-                gap: 15px;
-                margin-top: 15px;
-            }
-            .stat-card {
-                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-                color: white;
-                padding: 20px;
-                border-radius: 8px;
-                text-align: center;
-            }
-            .stat-value {
-                font-size: 32px;
-                font-weight: bold;
-                margin-bottom: 5px;
-            }
-            .stat-label {
-                font-size: 14px;
-                opacity: 0.9;
-            }
-            .tabs {
-                display: flex;
-                gap: 10px;
-                margin-bottom: 20px;
-                border-bottom: 2px solid #ddd;
-            }
-            .tab {
-                padding: 10px 20px;
-                cursor: pointer;
-                background: none;
-                border: none;
-                border-bottom: 3px solid transparent;
-                font-size: 14px;
-                font-weight: bold;
-                color: #666;
-            }
-            .tab.active {
-                color: #4CAF50;
-                border-bottom-color: #4CAF50;
-            }
-            .tab-content { display: none; }
-            .tab-content.active { display: block; }
-        </style>
+        
     </head>
     <body>
         <h1>🧠 BuildAutomata Memory System</h1>
 
-        <div class="tabs">
-            <button class="tab active" onclick="showTab('store')">Store Memory</button>
-            <button class="tab" onclick="showTab('search')">Search</button>
-            <button class="tab" onclick="showTab('intentions')">Intentions</button>
-            <button class="tab" onclick="showTab('timeline')">Timeline</button>
-            <button class="tab" onclick="showTab('stats')">Statistics</button>
-        </div>
-
-        <!-- Store Memory Tab -->
-        <div id="store" class="tab-content active">
-            <div class="container">
-                <h2>Store New Memory</h2>
-                <div class="form-group">
-                    <label>Content:</label>
-                    <textarea id="storeContent" placeholder="Enter memory content..."></textarea>
-                </div>
-                <div class="form-group">
-                    <label>Category:</label>
-                    <select id="storeCategory">
-                        <option value="general">General</option>
-                        <option value="research">Research</option>
-                        <option value="implementation">Implementation</option>
-                        <option value="philosophy">Philosophy</option>
-                        <option value="synthesis">Synthesis</option>
-                        <option value="project_context">Project Context</option>
-                        <option value="session_start">Session Start</option>
-                    </select>
-                </div>
-                <div class="form-group">
-                    <label>Importance (0-1):</label>
-                    <input type="number" id="storeImportance" value="0.7" min="0" max="1" step="0.1">
-                </div>
-                <div class="form-group">
-                    <label>Tags (comma-separated):</label>
-                    <input type="text" id="storeTags" placeholder="tag1, tag2, tag3">
-                </div>
-                <button onclick="storeMemory()">Store Memory</button>
-            </div>
-        </div>
-
-        <!-- Search Tab -->
-        <div id="search" class="tab-content">
-            <div class="container">
-                <h2>Search Memories</h2>
-                <div class="form-group">
-                    <label>Query:</label>
-                    <input type="text" id="searchQuery" placeholder="Search for...">
-                </div>
-                <div class="form-group">
-                    <label>Limit:</label>
-                    <input type="number" id="searchLimit" value="10" min="1" max="100">
-                </div>
-                <div class="form-group">
-                    <label>Category (optional):</label>
-                    <select id="searchCategory">
-                        <option value="">All Categories</option>
-                        <option value="research">Research</option>
-                        <option value="implementation">Implementation</option>
-                        <option value="philosophy">Philosophy</option>
-                        <option value="synthesis">Synthesis</option>
-                        <option value="project_context">Project Context</option>
-                    </select>
-                </div>
-                <div class="form-group">
-                    <label>Min Importance:</label>
-                    <input type="number" id="searchMinImportance" value="0" min="0" max="1" step="0.1">
-                </div>
-                <button onclick="searchMemories()">Search</button>
-            </div>
-        </div>
-
-        <!-- Intentions Tab -->
-        <div id="intentions" class="tab-content">
-            <div class="container">
-                <h2>Create Intention</h2>
-                <div class="form-group">
-                    <label>Description:</label>
-                    <textarea id="intentionDesc" placeholder="What do you intend to accomplish?"></textarea>
-                </div>
-                <div class="form-group">
-                    <label>Priority:</label>
-                    <select id="intentionPriority">
-                        <option value="low">Low</option>
-                        <option value="medium" selected>Medium</option>
-                        <option value="high">High</option>
-                        <option value="urgent">Urgent</option>
-                    </select>
-                </div>
-                <div class="form-group">
-                    <label>Deadline (ISO format, optional):</label>
-                    <input type="text" id="intentionDeadline" placeholder="2025-11-17T00:00:00">
-                </div>
-                <div class="form-group">
-                    <label>Actions (one per line):</label>
-                    <textarea id="intentionActions" placeholder="Action 1\nAction 2\nAction 3"></textarea>
-                </div>
-                <button onclick="storeIntention()">Create Intention</button>
-                <button class="secondary" onclick="getActiveIntentions()" style="margin-left: 10px;">View Active Intentions</button>
-            </div>
-        </div>
-
-        <!-- Timeline Tab -->
-        <div id="timeline" class="tab-content">
-            <div class="container">
-                <h2>Memory Timeline</h2>
-                <div class="form-group">
-                    <label>Memory ID (optional):</label>
-                    <input type="text" id="timelineMemoryId" placeholder="Leave empty for query-based timeline">
-                </div>
-                <div class="form-group">
-                    <label>Query:</label>
-                    <input type="text" id="timelineQuery" placeholder="Search query for timeline">
-                </div>
-                <div class="form-group">
-                    <label>Limit:</label>
-                    <input type="number" id="timelineLimit" value="10" min="1" max="100">
-                </div>
-                <button onclick="getTimeline()">Get Timeline</button>
-            </div>
-        </div>
-
-        <!-- Stats Tab -->
-        <div id="stats" class="tab-content">
-            <div class="container">
-                <h2>Memory Statistics</h2>
-                <button onclick="getStats()">Refresh Statistics</button>
-            </div>
-        </div>
-
-        <div id="results"></div>
-
-        <script>
-            function showTab(tabName) {
-                // Hide all tabs
-                document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
-                document.querySelectorAll('.tab').forEach(el => el.classList.remove('active'));
-
-                // Show selected tab
-                document.getElementById(tabName).classList.add('active');
-                event.target.classList.add('active');
-            }
-
-            async function storeMemory() {
-                const content = document.getElementById('storeContent').value;
-                const category = document.getElementById('storeCategory').value;
-                const importance = parseFloat(document.getElementById('storeImportance').value);
-                const tagsText = document.getElementById('storeTags').value;
-                const tags = tagsText ? tagsText.split(',').map(t => t.trim()) : null;
-
-                try {
-                    const response = await fetch('/api/memories', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ content, category, importance, tags })
-                    });
-                    const data = await response.json();
-                    document.getElementById('results').textContent = JSON.stringify(data, null, 2);
-                } catch (error) {
-                    document.getElementById('results').textContent = 'Error: ' + error.message;
-                }
-            }
-
-            async function searchMemories() {
-                const query = document.getElementById('searchQuery').value;
-                const limit = parseInt(document.getElementById('searchLimit').value);
-                const category = document.getElementById('searchCategory').value || null;
-                const minImportance = parseFloat(document.getElementById('searchMinImportance').value) || null;
-
-                try {
-                    const params = new URLSearchParams({ query, limit });
-                    if (category) params.append('category', category);
-                    if (minImportance) params.append('min_importance', minImportance);
-
-                    const response = await fetch('/api/memories/search?' + params);
-                    const data = await response.json();
-
-                    // Format results as cards
-                    if (data.memories && data.memories.length > 0) {
-                        let html = '<div style="background: white; padding: 15px; border-radius: 8px;">';
-                        html += '<h3>Found ' + data.memories.length + ' memories</h3>';
-                        data.memories.forEach(mem => {
-                            html += '<div class="memory-card">';
-                            html += '<div class="memory-content">' + escapeHtml(mem.content) + '</div>';
-                            html += '<div class="memory-meta">';
-                            html += '<strong>ID:</strong> ' + mem.memory_id + ' | ';
-                            html += '<strong>Category:</strong> ' + mem.category + ' | ';
-                            html += '<strong>Importance:</strong> ' + mem.importance.toFixed(2) + ' | ';
-                            html += '<strong>Created:</strong> ' + new Date(mem.created_at).toLocaleString();
-                            if (mem.tags && mem.tags.length > 0) {
-                                html += '<br>';
-                                mem.tags.forEach(tag => {
-                                    html += '<span class="tag">' + tag + '</span>';
-                                });
-                            }
-                            html += '</div></div>';
-                        });
-                        html += '</div>';
-                        document.getElementById('results').innerHTML = html;
-                    } else {
-                        document.getElementById('results').textContent = 'No memories found';
-                    }
-                } catch (error) {
-                    document.getElementById('results').textContent = 'Error: ' + error.message;
-                }
-            }
-
-            async function storeIntention() {
-                const description = document.getElementById('intentionDesc').value;
-                const priority = document.getElementById('intentionPriority').value;
-                const deadline = document.getElementById('intentionDeadline').value || null;
-                const actionsText = document.getElementById('intentionActions').value;
-                const actions = actionsText ? actionsText.split('\n').filter(a => a.trim()) : null;
-
-                try {
-                    const response = await fetch('/api/intentions', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ description, priority, deadline, actions })
-                    });
-                    const data = await response.json();
-                    document.getElementById('results').textContent = JSON.stringify(data, null, 2);
-                } catch (error) {
-                    document.getElementById('results').textContent = 'Error: ' + error.message;
-                }
-            }
-
-            async function getActiveIntentions() {
-                try {
-                    const response = await fetch('/api/intentions/active');
-                    const data = await response.json();
-                    document.getElementById('results').textContent = JSON.stringify(data, null, 2);
-                } catch (error) {
-                    document.getElementById('results').textContent = 'Error: ' + error.message;
-                }
-            }
-
-            async function getTimeline() {
-                const memoryId = document.getElementById('timelineMemoryId').value || null;
-                const query = document.getElementById('timelineQuery').value || null;
-                const limit = parseInt(document.getElementById('timelineLimit').value);
-
-                try {
-                    const params = new URLSearchParams({ limit });
-                    if (memoryId) params.append('memory_id', memoryId);
-                    if (query) params.append('query', query);
-
-                    const response = await fetch('/api/timeline?' + params);
-                    const data = await response.json();
-                    document.getElementById('results').textContent = JSON.stringify(data, null, 2);
-                } catch (error) {
-                    document.getElementById('results').textContent = 'Error: ' + error.message;
-                }
-            }
-
-            async function getStats() {
-                try {
-                    const response = await fetch('/api/stats');
-                    const data = await response.json();
-
-                    // Format stats as cards
-                    let html = '<div class="stats-grid">';
-                    html += '<div class="stat-card"><div class="stat-value">' + data.total_memories + '</div><div class="stat-label">Total Memories</div></div>';
-                    html += '<div class="stat-card"><div class="stat-value">' + Object.keys(data.by_category).length + '</div><div class="stat-label">Categories</div></div>';
-                    html += '<div class="stat-card"><div class="stat-value">' + data.total_versions + '</div><div class="stat-label">Total Versions</div></div>';
-                    html += '<div class="stat-card"><div class="stat-value">' + data.avg_importance.toFixed(2) + '</div><div class="stat-label">Avg Importance</div></div>';
-                    html += '</div>';
-
-                    html += '<pre style="background: white; padding: 15px; border-radius: 8px; margin-top: 20px;">';
-                    html += JSON.stringify(data, null, 2);
-                    html += '</pre>';
-
-                    document.getElementById('results').innerHTML = html;
-                } catch (error) {
-                    document.getElementById('results').textContent = 'Error: ' + error.message;
-                }
-            }
-
-            function escapeHtml(text) {
-                const div = document.createElement('div');
-                div.textContent = text;
-                return div.innerHTML;
-            }
-
-            // Load stats on page load
-            window.onload = () => getStats();
-        </script>
+        <p>Access through the api.</p>
     </body>
     </html>
     """
 
 
 @app.post("/api/memories")
-async def create_memory(request: StoreMemoryRequest):
+async def create_memory(
+    request: StoreMemoryRequest,
+    store: MemoryStore = Depends(get_memory_store)
+):
     """Store a new memory."""
     try:
-        store = get_memory_store()
 
         # Create Memory object (matching MCP pattern)
         memory = Memory(
@@ -582,11 +221,11 @@ async def search_memories(
     category: Optional[str] = None,
     min_importance: Optional[float] = Query(None, ge=0.0, le=1.0),
     memory_type: Optional[str] = None,
-    session_id: Optional[str] = None
+    session_id: Optional[str] = None,
+    store: MemoryStore = Depends(get_memory_store)
 ):
     """Search memories."""
     try:
-        store = get_memory_store()
 
         # FIXED: Properly await async method
         results = await store.search_memories(
@@ -621,10 +260,9 @@ async def search_memories(
 
 @app.put("/api/memories/{memory_id}")
 @app.post("/tool/update_memory")
-async def update_memory(memory_id: str = None, request: UpdateMemoryRequest = None):
+async def update_memory(memory_id: str = None, request: UpdateMemoryRequest = None, store: MemoryStore = Depends(get_memory_store)):
     """Update an existing memory."""
     try:
-        store = get_memory_store()
 
         # Handle both path parameter and request body
         if not memory_id and request:
@@ -654,10 +292,9 @@ async def update_memory(memory_id: str = None, request: UpdateMemoryRequest = No
 
 
 @app.post("/api/intentions")
-async def create_intention(request: StoreIntentionRequest):
+async def create_intention(request: StoreIntentionRequest, store: MemoryStore = Depends(get_memory_store)):
     """Store a new intention."""
     try:
-        store = get_memory_store()
 
         # Convert string priority to float
         priority_map = {
@@ -684,10 +321,9 @@ async def create_intention(request: StoreIntentionRequest):
 
 
 @app.get("/api/intentions/active")
-async def get_active_intentions():
+async def get_active_intentions(store: MemoryStore = Depends(get_memory_store)):
     """Get active intentions."""
     try:
-        store = get_memory_store()
 
         # FIXED: Properly await async method
         intentions = await store.get_active_intentions()
@@ -711,10 +347,9 @@ async def get_active_intentions():
 
 
 @app.put("/api/intentions/{intention_id}/status")
-async def update_intention_status(intention_id: str, request: UpdateIntentionStatusRequest):
+async def update_intention_status(intention_id: str, request: UpdateIntentionStatusRequest, store: MemoryStore = Depends(get_memory_store)):
     """Update intention status."""
     try:
-        store = get_memory_store()
 
         # FIXED: Need to implement
         raise HTTPException(status_code=501, detail="Update intention not implemented yet")
@@ -731,7 +366,6 @@ async def get_timeline(
 ):
     """Get memory timeline."""
     try:
-        store = get_memory_store()
 
         # FIXED: Properly await async method
         timeline = await store.get_memory_timeline(
@@ -746,10 +380,9 @@ async def get_timeline(
 
 
 @app.get("/api/stats")
-async def get_stats():
+async def get_stats(store: MemoryStore = Depends(get_memory_store)):
     """Get memory statistics."""
     try:
-        store = get_memory_store()
         # NOTE: get_statistics is synchronous, no await needed
         stats = store.get_statistics()
         return stats
@@ -758,46 +391,19 @@ async def get_stats():
 
 
 @app.get("/api/init")
-async def initialize_agent():
-    """Initialize agent - load context, intentions, continuity."""
+async def initialize_agent(store: MemoryStore = Depends(get_memory_store)):
+    """Initialize agent - load context, intentions, continuity, and working set."""
     try:
-        store = get_memory_store()
 
-        # FIXED: Implement proper initialization instead of non-existent proactive_scan
-        result = {
-            "status": "initialized",
-            "backend_status": {
-                "sqlite": "available" if store.db_conn else "unavailable",
-                "qdrant": "available" if store.qdrant_client else "unavailable",
-                "embeddings": "available" if store.encoder else "unavailable"
-            }
+        # Use MCP's proactive_initialization_scan - includes working set
+        result = await store.intention_mgr.proactive_initialization_scan()
+
+        # Add backend status
+        result["backend_status"] = {
+            "sqlite": "available" if store.db_conn else "unavailable",
+            "qdrant": "available" if store.qdrant_client else "unavailable",
+            "embeddings": "available" if store.encoder else "unavailable"
         }
-
-        # Get recent high-importance memories for context
-        recent_memories = await store.search_memories(
-            query="context persona identity",
-            limit=5,
-            min_importance=0.8
-        )
-
-        result["recent_context"] = [
-            {
-                "content": mem.get("content"),
-                "category": mem.get("category"),
-                "importance": mem.get("importance")
-            }
-            for mem in recent_memories[:3]
-        ]
-
-        # Get active intentions
-        intentions = await store.get_active_intentions(limit=5)
-        result["active_intentions"] = [
-            {
-                "description": intent.get("description"),
-                "priority": intent.get("priority")
-            }
-            for intent in intentions
-        ]
 
         return result
 
@@ -806,10 +412,9 @@ async def initialize_agent():
 
 
 @app.post("/api/memories/session")
-async def get_session_memories_api(request: GetSessionMemoriesRequest):
+async def get_session_memories_api(request: GetSessionMemoriesRequest, store: MemoryStore = Depends(get_memory_store)):
     """Get memories from a work session or time period."""
     try:
-        store = get_memory_store()
 
         date_range = None
         if request.start_date and request.end_date:
@@ -834,10 +439,9 @@ async def get_session_memories_api(request: GetSessionMemoriesRequest):
 
 
 @app.post("/api/memories/consolidate")
-async def consolidate_memories_api(request: ConsolidateMemoriesRequest):
+async def consolidate_memories_api(request: ConsolidateMemoriesRequest, store: MemoryStore = Depends(get_memory_store)):
     """Consolidate multiple episodic memories into semantic memory."""
     try:
-        store = get_memory_store()
 
         result = await store.consolidate_memories(
             memory_ids=request.memory_ids,
@@ -1026,16 +630,15 @@ async def tool_get_active_intentions():
 
 
 @app.post("/tool/store_intention")
-async def tool_store_intention(request: StoreIntentionRequest):
+async def tool_store_intention(request: StoreIntentionRequest, store: MemoryStore = Depends(get_memory_store)):
     """Tool endpoint: Store a new intention."""
     return await create_intention(request)
 
 
 @app.post("/tool/update_intention_status")
-async def tool_update_intention_status(request: UpdateIntentionStatusRequest):
+async def tool_update_intention_status(request: UpdateIntentionStatusRequest, store: MemoryStore = Depends(get_memory_store)):
     """Tool endpoint: Update intention status."""
     try:
-        store = get_memory_store()
 
         result = await store.update_intention_status(
             intention_id=request.intention_id,
@@ -1052,6 +655,27 @@ async def tool_update_intention_status(request: UpdateIntentionStatusRequest):
 async def tool_initialize_agent():
     """Tool endpoint: Initialize agent."""
     return await initialize_agent()
+
+
+@app.get("/tool/get_command_history")
+async def tool_get_command_history(
+    limit: int = Query(20, ge=1, le=1000),
+    tool_name: Optional[str] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    store: MemoryStore = Depends(get_memory_store)
+):
+    """Tool endpoint: Get command history for audit trail and session reconstruction."""
+    try:
+        result = store.sqlite_store.get_command_history(
+            limit=limit,
+            tool_name=tool_name,
+            start_date=start_date,
+            end_date=end_date
+        )
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/tool/get_session_memories")
@@ -1074,7 +698,6 @@ async def tool_consolidate_memories(request: ConsolidateMemoriesRequest):
 async def get_most_accessed_memories(limit: int = Query(20, ge=1, le=100)):
     """Get most frequently accessed memories."""
     try:
-        store = get_memory_store()
         result = await store.get_most_accessed_memories(limit=limit)
         return result
     except Exception as e:
@@ -1089,7 +712,6 @@ async def get_least_accessed_memories(
 ):
     """Get least accessed memories (candidates for pruning)."""
     try:
-        store = get_memory_store()
         result = await store.get_least_accessed_memories(limit=limit, min_age_days=min_age_days)
         return result
     except Exception as e:
@@ -1098,11 +720,14 @@ async def get_least_accessed_memories(
 
 @app.get("/tool/get_memory_by_id/{memory_id}")
 @app.get("/api/memories/{memory_id}")
-async def get_memory_by_id(memory_id: str):
-    """Get a specific memory by ID."""
+async def get_memory_by_id(
+    memory_id: str,
+    expand_related: bool = Query(False, description="Include full content of related memories"),
+    max_depth: int = Query(1, ge=1, le=3, description="Expansion depth (1-3 hops)")
+):
+    """Get a specific memory by ID with optional related memory expansion."""
     try:
-        store = get_memory_store()
-        result = await store.get_memory_by_id(memory_id)
+        result = await store.get_memory_by_id(memory_id, expand_related=expand_related, max_depth=max_depth)
         return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -1113,7 +738,6 @@ async def get_memory_by_id(memory_id: str):
 async def list_categories(min_count: int = Query(1, ge=1)):
     """List all categories with their counts."""
     try:
-        store = get_memory_store()
         result = await store.list_categories(min_count=min_count)
         return result
     except Exception as e:
@@ -1125,7 +749,6 @@ async def list_categories(min_count: int = Query(1, ge=1)):
 async def list_tags(min_count: int = Query(1, ge=1)):
     """List all tags with their counts."""
     try:
-        store = get_memory_store()
         result = await store.list_tags(min_count=min_count)
         return result
     except Exception as e:
@@ -1134,10 +757,9 @@ async def list_tags(min_count: int = Query(1, ge=1)):
 
 @app.get("/tool/check_intention/{intention_id}")
 @app.get("/api/intentions/{intention_id}")
-async def check_intention(intention_id: str):
+async def check_intention(intention_id: str, store: MemoryStore = Depends(get_memory_store)):
     """Check status of a specific intention."""
     try:
-        store = get_memory_store()
         result = await store.check_intention(intention_id)
         return result
     except Exception as e:
@@ -1146,10 +768,9 @@ async def check_intention(intention_id: str):
 
 @app.post("/tool/maintenance")
 @app.post("/api/maintenance")
-async def maintenance():
+async def maintenance(store: MemoryStore = Depends(get_memory_store)):
     """Run maintenance operations."""
     try:
-        store = get_memory_store()
         result = await store.maintenance()
         return result
     except Exception as e:
@@ -1164,7 +785,6 @@ async def prune_old_memories(
 ):
     """Prune old, low-importance memories."""
     try:
-        store = get_memory_store()
         result = await store.prune_old_memories(max_memories=max_memories, dry_run=dry_run)
         return result
     except Exception as e:
@@ -1182,7 +802,6 @@ async def traverse_memory_graph(
 ):
     """Traverse memory graph N hops from starting node. Returns subgraph showing connections."""
     try:
-        store = get_memory_store()
         result = await store.traverse_graph(
             start_memory_id=start_memory_id,
             depth=depth,
@@ -1204,7 +823,6 @@ async def find_memory_clusters(
 ):
     """Find densely connected regions in memory graph. Discovers thematic groups."""
     try:
-        store = get_memory_store()
         result = await store.find_clusters(
             min_cluster_size=min_cluster_size,
             min_importance=min_importance,
@@ -1223,7 +841,6 @@ async def get_memory_graph_stats(
 ):
     """Get graph connectivity statistics - hubs, isolated nodes, connectivity distribution."""
     try:
-        store = get_memory_store()
         result = await store.get_graph_statistics(
             category=category,
             min_importance=min_importance
@@ -1235,7 +852,7 @@ async def get_memory_graph_stats(
 
 if __name__ == "__main__":
     print("=" * 80)
-    print("BuildAutomata Memory Web Server (FIXED VERSION)")
+    print("BuildAutomata Memory Web Server")
     print("=" * 80)
     print()
     print("Access points:")
@@ -1245,11 +862,6 @@ if __name__ == "__main__":
     print()
     print("Tool endpoints available at: /tool/{tool_name}")
     print()
-    print("FIXES Applied:")
-    print("  ✓ All async methods properly awaited")
-    print("  ✓ Memory objects created correctly")
-    print("  ✓ Initialize endpoint implemented (replaces proactive_scan)")
-    print("  ✓ Proper error handling")
     print()
     print("=" * 80)
     print()

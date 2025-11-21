@@ -43,23 +43,33 @@ from mcp.server import NotificationOptions, Server
 from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent, Prompt, Resource, PromptMessage, GetPromptResult
 
-# Register datetime adapters for Python 3.12+ compatibility
-def _adapt_datetime(dt: datetime) -> str:
-    """Convert datetime to ISO format string for SQLite storage"""
-    return dt.isoformat()
+# Import and register datetime adapters
+# Handle both package import and direct execution
+try:
+    from .utils import register_sqlite_adapters
+    from .models import Memory, Intention, MemoryRelationship
+    from .cache import LRUCache
+    from .storage.embeddings import EmbeddingGenerator
+    from .storage.qdrant_store import QdrantStore
+    from .storage.sqlite_store import SQLiteStore
+    from .graph_ops import GraphOperations
+    from .timeline import TimelineAnalysis
+    from .intentions import IntentionManager
+    from .mcp_tools import get_tool_definitions, handle_tool_call
+except ImportError:
+    # Direct execution fallback
+    from utils import register_sqlite_adapters
+    from models import Memory, Intention, MemoryRelationship
+    from cache import LRUCache
+    from storage.embeddings import EmbeddingGenerator
+    from storage.qdrant_store import QdrantStore
+    from storage.sqlite_store import SQLiteStore
+    from graph_ops import GraphOperations
+    from timeline import TimelineAnalysis
+    from intentions import IntentionManager
+    from mcp_tools import get_tool_definitions, handle_tool_call
 
-def _convert_timestamp(val: Union[str, bytes]) -> Optional[datetime]:
-    """Convert timestamp string to datetime with error handling"""
-    try:
-        decoded = val.decode() if isinstance(val, bytes) else val
-        return datetime.fromisoformat(decoded)
-    except (ValueError, AttributeError) as e:
-        # Log warning but don't crash - return None for malformed timestamps
-        logger.warning(f"Failed to convert timestamp: {val}, error: {e}")
-        return None
-
-sqlite3.register_adapter(datetime, _adapt_datetime)
-sqlite3.register_converter("TIMESTAMP", _convert_timestamp)
+register_sqlite_adapters()
 
 try:
     from qdrant_client import QdrantClient
@@ -85,200 +95,7 @@ except ImportError:
     logger.warning("SentenceTransformers not available - using fallback embeddings")
 
 
-class LRUCache(OrderedDict):
-    """Simple LRU cache with max size"""
-    def __init__(self, maxsize=1000):
-        self.maxsize = maxsize
-        super().__init__()
-
-    def __setitem__(self, key, value):
-        if key in self:
-            self.move_to_end(key)
-        super().__setitem__(key, value)
-        if len(self) > self.maxsize:
-            oldest = next(iter(self))
-            del self[oldest]
-
-    def __getitem__(self, key):
-        value = super().__getitem__(key)
-        self.move_to_end(key)
-        return value
-
-
-@dataclass
-class MemoryRelationship:
-    """Typed relationship between memories"""
-    target_memory_id: str
-    relationship_type: str  # builds_on | contradicts | implements | analyzes | references
-    strength: float  # 0.0-1.0
-    created_at: datetime
-    metadata: Dict[str, Any] = None
-
-    def __post_init__(self):
-        if self.metadata is None:
-            self.metadata = {}
-        if isinstance(self.created_at, str):
-            self.created_at = datetime.fromisoformat(self.created_at)
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "target_memory_id": self.target_memory_id,
-            "relationship_type": self.relationship_type,
-            "strength": self.strength,
-            "created_at": self.created_at.isoformat(),
-            "metadata": self.metadata
-        }
-
-
-@dataclass
-class Memory:
-    id: str
-    content: str
-    category: str
-    importance: float
-    tags: List[str]
-    metadata: Dict[str, Any]
-    created_at: datetime
-    updated_at: datetime
-    access_count: int = 0
-    last_accessed: Optional[datetime] = None
-    # Bi-temporal validity: when the content was/is actually valid
-    valid_from: Optional[datetime] = None  # When this knowledge became valid
-    valid_until: Optional[datetime] = None  # When this knowledge became invalid (None = still valid)
-    related_memories: List[str] = None
-    decay_rate: float = 0.95
-    version_count: int = 1
-    # NEW: Memory type classification
-    memory_type: str = "episodic"  # episodic | semantic | working
-    # NEW: Session and task context
-    session_id: Optional[str] = None
-    task_context: Optional[str] = None
-    # NEW: Provenance tracking
-    provenance: Optional[Dict[str, Any]] = None
-    # NEW: Typed relationships
-    relationships: Optional[List[MemoryRelationship]] = None
-
-    def __post_init__(self):
-        if self.related_memories is None:
-            self.related_memories = []
-        if self.relationships is None:
-            self.relationships = []
-        if self.provenance is None:
-            self.provenance = {
-                "retrieval_queries": [],
-                "usage_contexts": [],
-                "parent_memory_ids": [],
-                "consolidation_date": None,
-                "created_by_session": self.session_id
-            }
-        if isinstance(self.created_at, str):
-            self.created_at = datetime.fromisoformat(self.created_at)
-        if isinstance(self.updated_at, str):
-            self.updated_at = datetime.fromisoformat(self.updated_at)
-        if self.last_accessed and isinstance(self.last_accessed, str):
-            self.last_accessed = datetime.fromisoformat(self.last_accessed)
-        if self.valid_from and isinstance(self.valid_from, str):
-            self.valid_from = datetime.fromisoformat(self.valid_from)
-        if self.valid_until and isinstance(self.valid_until, str):
-            self.valid_until = datetime.fromisoformat(self.valid_until)
-        # Convert relationship dicts back to objects if needed
-        if self.relationships and isinstance(self.relationships[0], dict):
-            self.relationships = [
-                MemoryRelationship(**r) if isinstance(r, dict) else r
-                for r in self.relationships
-            ]
-
-    def to_dict(self) -> Dict[str, Any]:
-        data = asdict(self)
-        data["created_at"] = self.created_at.isoformat()
-        data["updated_at"] = self.updated_at.isoformat()
-        if self.last_accessed:
-            data["last_accessed"] = self.last_accessed.isoformat()
-        # Convert relationships to dicts
-        if self.relationships:
-            data["relationships"] = [r.to_dict() if isinstance(r, MemoryRelationship) else r for r in self.relationships]
-        return data
-
-    def current_importance(self) -> float:
-        """Calculate current importance with decay
-
-        Decay is based on time since last access, or creation date if never accessed.
-        This ensures never-used memories decay naturally rather than maintaining
-        artificially high importance forever.
-        """
-        # Use last_accessed if available, otherwise fall back to created_at
-        reference_date = self.last_accessed if self.last_accessed else self.created_at
-
-        if not reference_date:
-            return self.importance
-
-        days = (datetime.now() - reference_date).days
-        return max(0.1, min(1.0, self.importance * (self.decay_rate ** days)))
-
-    def content_hash(self) -> str:
-        """Generate hash of memory content for deduplication"""
-        content_str = f"{self.content}|{self.category}|{self.importance}|{','.join(sorted(self.tags))}"
-        return hashlib.sha256(content_str.encode()).hexdigest()
-
-
-@dataclass
-class Intention:
-    """First-class intention entity for proactive agency"""
-    id: str
-    description: str
-    priority: float  # 0.0 to 1.0
-    status: str  # pending, active, completed, cancelled
-    created_at: datetime
-    updated_at: datetime
-    deadline: Optional[datetime] = None
-    preconditions: List[str] = None
-    actions: List[str] = None
-    related_memories: List[str] = None
-    metadata: Dict[str, Any] = None
-    last_checked: Optional[datetime] = None
-    check_count: int = 0
-
-    def __post_init__(self):
-        if self.preconditions is None:
-            self.preconditions = []
-        if self.actions is None:
-            self.actions = []
-        if self.related_memories is None:
-            self.related_memories = []
-        if self.metadata is None:
-            self.metadata = {}
-        if isinstance(self.created_at, str):
-            self.created_at = datetime.fromisoformat(self.created_at)
-        if isinstance(self.updated_at, str):
-            self.updated_at = datetime.fromisoformat(self.updated_at)
-        if self.deadline and isinstance(self.deadline, str):
-            self.deadline = datetime.fromisoformat(self.deadline)
-        if self.last_checked and isinstance(self.last_checked, str):
-            self.last_checked = datetime.fromisoformat(self.last_checked)
-
-    def to_dict(self) -> Dict[str, Any]:
-        data = asdict(self)
-        data["created_at"] = self.created_at.isoformat()
-        data["updated_at"] = self.updated_at.isoformat()
-        if self.deadline:
-            data["deadline"] = self.deadline.isoformat()
-        if self.last_checked:
-            data["last_checked"] = self.last_checked.isoformat()
-        return data
-
-    def is_overdue(self) -> bool:
-        """Check if intention is past its deadline"""
-        if not self.deadline:
-            return False
-        return datetime.now() > self.deadline
-
-    def days_until_deadline(self) -> Optional[float]:
-        """Calculate days until deadline"""
-        if not self.deadline:
-            return None
-        delta = self.deadline - datetime.now()
-        return delta.total_seconds() / 86400
-
+# LRUCache, Memory, Intention, and MemoryRelationship now imported from modules
 
 class MemoryStore:
     def __init__(self, username: str, agent_name: str, lazy_load: bool = False):
@@ -287,22 +104,24 @@ class MemoryStore:
         self.collection_name = f"{username}_{agent_name}_memories"
         self.lazy_load = lazy_load
 
-        self.config = {
-            "qdrant_host": os.getenv("QDRANT_HOST", "localhost"),
-            "qdrant_port": int(os.getenv("QDRANT_PORT", 6333)),
-            "vector_size": 768,
-            "max_memories": int(os.getenv("MAX_MEMORIES", 10000)),
-            "cache_maxsize": int(os.getenv("CACHE_MAXSIZE", 1000)),
-            "qdrant_max_retries": int(os.getenv("QDRANT_MAX_RETRIES", 3)),
-            "maintenance_interval_hours": int(os.getenv("MAINTENANCE_INTERVAL_HOURS", 24)),
-        }
-
         script_dir = Path(__file__).parent
         self.base_path = script_dir / "memory_repos" / f"{username}_{agent_name}"
         self.db_path = self.base_path / "memoryv012.db"
 
+        # EMBEDDED MODE: Qdrant data stored alongside SQLite database
+        self.qdrant_path = str(self.base_path / "qdrant_data")
+
+        self.config = {
+            "qdrant_path": self.qdrant_path,
+            "vector_size": 768,
+            "max_memories": int(os.getenv("MAX_MEMORIES", 10000)),
+            "cache_maxsize": int(os.getenv("CACHE_MAXSIZE", 1000)),
+            "maintenance_interval_hours": int(os.getenv("MAINTENANCE_INTERVAL_HOURS", 24)),
+            "qdrant_max_retries": int(os.getenv("QDRANT_MAX_RETRIES", 3)),
+        }
+
         self.qdrant_client = None
-        self.encoder = None
+        self.encoder = None  # Kept for backward compatibility, but now managed by EmbeddingGenerator
         self.db_conn = None
         self._qdrant_initialized = False
         self._encoder_initialized = False
@@ -316,6 +135,31 @@ class MemoryStore:
 
         self.last_maintenance: Optional[datetime] = None
 
+        # Initialize embedding generator (manages encoder, caching, and fallback)
+        self.embedding_gen = EmbeddingGenerator(
+            config=self.config,
+            embedding_cache=self.embedding_cache,
+            error_log=self.error_log,
+            lazy_load=lazy_load
+        )
+
+        # Initialize Qdrant store (manages vector operations)
+        self.qdrant_store = QdrantStore(
+            config=self.config,
+            collection_name=self.collection_name,
+            error_log=self.error_log,
+            lazy_load=lazy_load
+        )
+        # Sync qdrant_client reference for backward compatibility
+        self.qdrant_client = self.qdrant_store.client
+
+        # Initialize SQLite store (placeholder - will be initialized in initialize())
+        self.sqlite_store = None
+        self.graph_ops = None
+        self.timeline = None
+        self.intention_mgr = None
+
+        # Initialize core (creates directories, db connection, calls module initializers)
         self.initialize()
 
     def initialize(self):
@@ -330,18 +174,45 @@ class MemoryStore:
 
             step_start = time.perf_counter()
             self._init_sqlite()
-            logger.info(f"[TIMING] SQLite initialized in {(time.perf_counter() - step_start)*1000:.2f}ms")
+            logger.info(f"[TIMING] SQLite connection created in {(time.perf_counter() - step_start)*1000:.2f}ms")
 
+            # Initialize SQLiteStore and delegate schema creation
+            step_start = time.perf_counter()
+            self.sqlite_store = SQLiteStore(
+                db_path=self.db_path,
+                db_conn=self.db_conn,
+                db_lock=self._db_lock,
+                error_log=self.error_log
+            )
+            self.sqlite_store.initialize()
+            logger.info(f"[TIMING] SQLiteStore initialized in {(time.perf_counter() - step_start)*1000:.2f}ms")
+
+            # Initialize graph operations (requires get_memory_by_id method)
+            self.graph_ops = GraphOperations(
+                db_conn=self.db_conn,
+                db_lock=self._db_lock,
+                get_memory_by_id_func=self.get_memory_by_id
+            )
+
+            # Initialize timeline analysis
+            self.timeline = TimelineAnalysis(
+                db_conn=self.db_conn,
+                db_lock=self._db_lock
+            )
+
+            # Initialize intention manager
+            self.intention_mgr = IntentionManager(
+                db_conn=self.db_conn,
+                db_lock=self._db_lock,
+                error_log=self.error_log,
+                get_working_set_func=self.get_working_set
+            )
+
+            # Qdrant and encoder initialization now handled by their respective modules
             if not self.lazy_load:
-                step_start = time.perf_counter()
-                self._init_qdrant()
-                logger.info(f"[TIMING] Qdrant initialized in {(time.perf_counter() - step_start)*1000:.2f}ms")
-
-                step_start = time.perf_counter()
-                self._init_encoder()
-                logger.info(f"[TIMING] Encoder initialized in {(time.perf_counter() - step_start)*1000:.2f}ms")
+                logger.info(f"[TIMING] Qdrant and Encoder initialized via storage modules (lazy_load={self.lazy_load})")
             else:
-                logger.info("[LAZY] Deferring Qdrant and encoder initialization until first use")
+                logger.info("[LAZY] Qdrant and Encoder will be loaded on-demand via storage modules")
 
             total_time = (time.perf_counter() - init_start) * 1000
             logger.info(f"[TIMING] MemoryStore initialized in {total_time:.2f}ms total")
@@ -359,7 +230,7 @@ class MemoryStore:
             raise
 
     def _init_sqlite(self):
-        """Initialize SQLite with temporal versioning support"""
+        """Create SQLite connection (schema creation delegated to SQLiteStore)"""
         try:
             self.db_conn = sqlite3.connect(
                 str(self.db_path),
@@ -369,257 +240,24 @@ class MemoryStore:
                 detect_types=sqlite3.PARSE_DECLTYPES | sqlite3.PARSE_COLNAMES
             )
             self.db_conn.row_factory = sqlite3.Row
-
-            with self._db_lock:
-                self.db_conn.executescript("""
-                    -- Main memories table (current version)
-                    CREATE TABLE IF NOT EXISTS memories (
-                        id TEXT PRIMARY KEY,
-                        content TEXT NOT NULL,
-                        category TEXT NOT NULL,
-                        importance REAL NOT NULL,
-                        tags TEXT,
-                        metadata TEXT,
-                        created_at TIMESTAMP NOT NULL,
-                        updated_at TIMESTAMP NOT NULL,
-                        last_accessed TIMESTAMP,
-                        access_count INTEGER DEFAULT 0,
-                        decay_rate REAL DEFAULT 0.95,
-                        version_count INTEGER DEFAULT 1,
-                        content_hash TEXT NOT NULL,
-                        memory_type TEXT DEFAULT 'episodic',
-                        session_id TEXT,
-                        task_context TEXT,
-                        provenance TEXT,
-                        relationships TEXT
-                    );
-
-                    -- Temporal versioning table (all historical versions)
-                    CREATE TABLE IF NOT EXISTS memory_versions (
-                        version_id TEXT PRIMARY KEY,
-                        memory_id TEXT NOT NULL,
-                        version_number INTEGER NOT NULL,
-                        content TEXT NOT NULL,
-                        category TEXT NOT NULL,
-                        importance REAL NOT NULL,
-                        tags TEXT NOT NULL,
-                        metadata TEXT,
-                        change_type TEXT NOT NULL,
-                        change_description TEXT,
-                        created_at TIMESTAMP NOT NULL,
-                        content_hash TEXT NOT NULL,
-                        prev_version_id TEXT,
-                        FOREIGN KEY (memory_id) REFERENCES memories(id),
-                        UNIQUE(memory_id, version_number)
-                    );
-
-                    CREATE TABLE IF NOT EXISTS relationships (
-                        source_id TEXT NOT NULL,
-                        target_id TEXT NOT NULL,
-                        relationship_type TEXT DEFAULT 'references',
-                        strength REAL DEFAULT 1.0,
-                        created_at TIMESTAMP NOT NULL,
-                        metadata TEXT,
-                        PRIMARY KEY (source_id, target_id, relationship_type)
-                    );
-
-                    -- Intentions table for Agency Bridge Pattern
-                    CREATE TABLE IF NOT EXISTS intentions (
-                        id TEXT PRIMARY KEY,
-                        description TEXT NOT NULL,
-                        priority REAL NOT NULL,
-                        status TEXT NOT NULL DEFAULT 'pending',
-                        created_at TIMESTAMP NOT NULL,
-                        updated_at TIMESTAMP NOT NULL,
-                        deadline TIMESTAMP,
-                        preconditions TEXT,
-                        actions TEXT,
-                        related_memories TEXT,
-                        metadata TEXT,
-                        last_checked TIMESTAMP,
-                        check_count INTEGER DEFAULT 0
-                    );
-
-                    CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
-                        id UNINDEXED,
-                        content,
-                        tags
-                    );
-
-                    -- Indexes for performance (base columns only)
-                    CREATE INDEX IF NOT EXISTS idx_category ON memories(category);
-                    CREATE INDEX IF NOT EXISTS idx_importance ON memories(importance DESC);
-                    CREATE INDEX IF NOT EXISTS idx_created ON memories(created_at DESC);
-                    CREATE INDEX IF NOT EXISTS idx_updated ON memories(updated_at DESC);
-                    CREATE INDEX IF NOT EXISTS idx_content_hash ON memories(content_hash);
-
-                    -- FIX: Added composite indexes for better query performance
-                    CREATE INDEX IF NOT EXISTS idx_category_importance
-                        ON memories(category, importance DESC, updated_at DESC);
-                    CREATE INDEX IF NOT EXISTS idx_search_filters
-                        ON memories(category, importance, created_at, updated_at);
-                    
-                    CREATE INDEX IF NOT EXISTS idx_version_memory ON memory_versions(memory_id, version_number DESC);
-                    CREATE INDEX IF NOT EXISTS idx_version_timestamp ON memory_versions(created_at DESC);
-                    CREATE INDEX IF NOT EXISTS idx_version_hash ON memory_versions(content_hash);
-                    
-                    CREATE INDEX IF NOT EXISTS idx_source ON relationships(source_id);
-                    CREATE INDEX IF NOT EXISTS idx_target ON relationships(target_id);
-
-                    -- Indexes for intentions
-                    CREATE INDEX IF NOT EXISTS idx_intention_status ON intentions(status, priority DESC);
-                    CREATE INDEX IF NOT EXISTS idx_intention_deadline ON intentions(deadline);
-                    CREATE INDEX IF NOT EXISTS idx_intention_priority ON intentions(priority DESC);
-                """)
-                self.db_conn.commit()
-
-                # MIGRATION: Add new columns to existing databases
-                cursor = self.db_conn.cursor()
-                try:
-                    cursor.execute("PRAGMA table_info(memories)")
-                    columns = {row[1] for row in cursor.fetchall()}
-
-                    if "memory_type" not in columns:
-                        logger.info("Migrating: adding memory_type column")
-                        cursor.execute("ALTER TABLE memories ADD COLUMN memory_type TEXT DEFAULT 'episodic'")
-
-                    if "session_id" not in columns:
-                        logger.info("Migrating: adding session_id column")
-                        cursor.execute("ALTER TABLE memories ADD COLUMN session_id TEXT")
-
-                    if "task_context" not in columns:
-                        logger.info("Migrating: adding task_context column")
-                        cursor.execute("ALTER TABLE memories ADD COLUMN task_context TEXT")
-
-                    if "provenance" not in columns:
-                        logger.info("Migrating: adding provenance column")
-                        cursor.execute("ALTER TABLE memories ADD COLUMN provenance TEXT")
-
-                    if "relationships" not in columns:
-                        logger.info("Migrating: adding relationships column")
-                        cursor.execute("ALTER TABLE memories ADD COLUMN relationships TEXT")
-
-                    if "valid_from" not in columns:
-                        logger.info("Migrating: adding valid_from column for bi-temporal tracking")
-                        cursor.execute("ALTER TABLE memories ADD COLUMN valid_from TIMESTAMP")
-
-                    if "valid_until" not in columns:
-                        logger.info("Migrating: adding valid_until column for bi-temporal tracking")
-                        cursor.execute("ALTER TABLE memories ADD COLUMN valid_until TIMESTAMP")
-
-                    if "related_memories" not in columns:
-                        logger.info("Migrating: adding related_memories column for auto-linking")
-                        cursor.execute("ALTER TABLE memories ADD COLUMN related_memories TEXT")
-
-                    self.db_conn.commit()
-                    logger.info("Migration completed successfully")
-
-                    # Create indexes on new columns after migration
-                    try:
-                        cursor.execute("CREATE INDEX IF NOT EXISTS idx_memory_type ON memories(memory_type)")
-                        cursor.execute("CREATE INDEX IF NOT EXISTS idx_session_id ON memories(session_id)")
-                        cursor.execute("CREATE INDEX IF NOT EXISTS idx_type_session ON memories(memory_type, session_id, created_at DESC)")
-                        self.db_conn.commit()
-                        logger.info("Indexes on new columns created successfully")
-                    except Exception as index_error:
-                        logger.warning(f"Index creation error (non-fatal): {index_error}")
-                        self.db_conn.rollback()
-
-                except Exception as migration_error:
-                    logger.warning(f"Migration error (non-fatal): {migration_error}")
-                    self.db_conn.rollback()
-
-            logger.info("SQLite initialized successfully with temporal versioning")
+            logger.info("SQLite connection created successfully")
         except Exception as e:
-            logger.error(f"SQLite initialization failed: {e}")
+            logger.error(f"SQLite connection failed: {e}")
             self._log_error("sqlite_init", e)
             self.db_conn = None
 
     def _ensure_qdrant(self):
-        """Ensure Qdrant is initialized (lazy loading support)"""
-        if self._qdrant_initialized or not self.lazy_load:
-            return
-
-        import time
-        start = time.perf_counter()
-        self._init_qdrant()
-        self._qdrant_initialized = True
-        logger.info(f"[LAZY] Qdrant loaded on-demand in {(time.perf_counter() - start)*1000:.2f}ms")
+        """Ensure Qdrant is initialized (delegated to QdrantStore)"""
+        # Trigger lazy initialization if needed
+        if hasattr(self.qdrant_store, '_ensure_initialized'):
+            self.qdrant_store._ensure_initialized()
+        # Sync reference for backward compatibility
+        self.qdrant_client = self.qdrant_store.client
 
     def _init_qdrant(self):
-        """Initialize Qdrant with retry logic"""
-        if not QDRANT_AVAILABLE:
-            logger.warning("Qdrant libraries not available")
-            return
-
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                self.qdrant_client = QdrantClient(
-                    host=self.config["qdrant_host"],
-                    port=self.config["qdrant_port"],
-                    timeout=30.0,
-                )
-
-                collections = self.qdrant_client.get_collections().collections
-                if not any(col.name == self.collection_name for col in collections):
-                    self.qdrant_client.create_collection(
-                        collection_name=self.collection_name,
-                        vectors_config=VectorParams(
-                            size=self.config["vector_size"], distance=Distance.COSINE
-                        ),
-                    )
-                    logger.info(f"Created Qdrant collection: {self.collection_name}")
-                else:
-                    logger.info(f"Using existing Qdrant collection: {self.collection_name}")
-                return  # Success
-
-            except Exception as e:
-                if attempt == max_retries - 1:
-                    logger.error(f"Qdrant initialization failed after {max_retries} attempts: {e}")
-                    self._log_error("qdrant_init", e)
-                    self.qdrant_client = None
-                else:
-                    logger.warning(f"Qdrant init attempt {attempt + 1} failed, retrying...")
-                    import time
-                    time.sleep(2 ** attempt)
-
-    def _ensure_encoder(self):
-        """Ensure encoder is initialized (lazy loading support)"""
-        if self._encoder_initialized or not self.lazy_load:
-            return
-
-        import time
-        start = time.perf_counter()
-        self._init_encoder()
-        self._encoder_initialized = True
-        logger.info(f"[LAZY] Encoder loaded on-demand in {(time.perf_counter() - start)*1000:.2f}ms")
-
-    def _init_encoder(self):
-        """Initialize sentence encoder"""
-        if not EMBEDDINGS_AVAILABLE:
-            logger.warning("SentenceTransformers not available, using fallback")
-            return
-
-        try:
-            self.encoder = SentenceTransformer("all-mpnet-base-v2", device="cpu")
-            # Model dimension is fixed at 768 for all-mpnet-base-v2
-            # Only test if config disagrees (first-time init or model change)
-            expected_size = 768
-            if self.config["vector_size"] != expected_size:
-                logger.info(f"Verifying encoder dimension (config mismatch: {self.config['vector_size']} != {expected_size})")
-                test_embedding = self.encoder.encode("test")
-                actual_size = len(test_embedding)
-                if actual_size != self.config["vector_size"]:
-                    logger.warning(f"Encoder size {actual_size} != config {self.config['vector_size']}, updating config")
-                    self.config["vector_size"] = actual_size
-                logger.info(f"Encoder initialized with dimension {actual_size}")
-            else:
-                logger.info(f"Encoder initialized with dimension {expected_size}")
-        except Exception as e:
-            logger.error(f"Encoder initialization failed: {e}")
-            self._log_error("encoder_init", e)
-            self.encoder = None
+        """Initialize Qdrant (delegated to QdrantStore - kept for compatibility)"""
+        # Sync reference for backward compatibility
+        self.qdrant_client = self.qdrant_store.client
 
     def _log_error(self, operation: str, error: Exception):
         """Log detailed error information"""
@@ -635,29 +273,10 @@ class MemoryStore:
             self.error_log = self.error_log[-100:]
 
     def generate_embedding(self, text: str) -> List[float]:
-        """Generate embedding with caching"""
-        self._ensure_encoder()
-
-        text_hash = hashlib.md5(text.encode()).hexdigest()
-
-        if text_hash in self.embedding_cache:
-            return self.embedding_cache[text_hash]
-
-        if self.encoder:
-            embedding = self.encoder.encode(text).tolist()
-        else:
-            # Fallback using repeated hash
-            embedding = []
-            hash_input = text.encode()
-            while len(embedding) < self.config["vector_size"]:
-                hash_obj = hashlib.sha256(hash_input)
-                hash_bytes = hash_obj.digest()
-                embedding.extend([float(b) / 255.0 for b in hash_bytes])
-                hash_input = hash_bytes
-            embedding = embedding[:self.config["vector_size"]]
-
-        self.embedding_cache[text_hash] = embedding
-        return embedding
+        """Generate embedding with caching - delegates to EmbeddingGenerator"""
+        # Sync encoder reference for backward compatibility
+        self.encoder = self.embedding_gen.encoder
+        return self.embedding_gen.generate_embedding(text)
 
     def _create_version(self, memory: Memory, change_type: str, change_description: str, prev_version_id: Optional[str] = None):
         """Create a version entry in memory_versions table with proper transaction handling"""
@@ -814,97 +433,8 @@ class MemoryStore:
         return result
 
     def _store_in_sqlite(self, memory: Memory, is_update: bool = False, skip_version: bool = False) -> bool:
-        """Store in SQLite with automatic versioning"""
-        if not self.db_conn:
-            return False
-
-        try:
-            with self._db_lock:
-                version_id = None
-                if not skip_version:
-                    # Get previous version if updating
-                    prev_version_id = None
-                    if is_update:
-                        cursor = self.db_conn.execute(
-                            "SELECT version_id FROM memory_versions WHERE memory_id = ? ORDER BY version_number DESC LIMIT 1",
-                            (memory.id,)
-                        )
-                        row = cursor.fetchone()
-                        if row:
-                            prev_version_id = row[0]
-
-                    # Create version snapshot
-                    change_type = "update" if is_update else "create"
-                    change_description = f"Memory {change_type}d"
-                    version_id = self._create_version(memory, change_type, change_description, prev_version_id)
-
-                    if not version_id and not skip_version:
-                        return False
-
-                # Update main memories table
-                self.db_conn.execute("""
-                    INSERT OR REPLACE INTO memories
-                    (id, content, category, importance, tags, metadata,
-                     created_at, updated_at, last_accessed, access_count, decay_rate,
-                     version_count, content_hash, memory_type, session_id, task_context,
-                     provenance, relationships, valid_from, valid_until, related_memories)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                            COALESCE((SELECT version_count FROM memories WHERE id = ?), 0) + ?, ?,
-                            ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    memory.id,
-                    memory.content,
-                    memory.category,
-                    memory.importance,
-                    json.dumps(memory.tags),
-                    json.dumps(memory.metadata),
-                    memory.created_at,
-                    memory.updated_at,
-                    memory.last_accessed,
-                    memory.access_count,
-                    memory.decay_rate,
-                    memory.id,
-                    0 if skip_version else 1,
-                    memory.content_hash(),
-                    memory.memory_type,
-                    memory.session_id,
-                    memory.task_context,
-                    json.dumps(memory.provenance) if memory.provenance else None,
-                    json.dumps([r.to_dict() for r in memory.relationships]) if memory.relationships else None,
-                    memory.valid_from,
-                    memory.valid_until,
-                    json.dumps(memory.related_memories) if memory.related_memories else None
-                ))
-
-                # Update FTS - FTS5 doesn't support REPLACE properly, so DELETE then INSERT
-                self.db_conn.execute("""
-                    DELETE FROM memories_fts WHERE id = ?
-                """, (memory.id,))
-                self.db_conn.execute("""
-                    INSERT INTO memories_fts(id, content, tags)
-                    VALUES (?, ?, ?)
-                """, (memory.id, memory.content, " ".join(memory.tags)))
-
-                # Handle relationships
-                if memory.related_memories:
-                    for related_id in memory.related_memories:
-                        self.db_conn.execute("""
-                            INSERT OR IGNORE INTO relationships
-                            (source_id, target_id, strength, created_at)
-                            VALUES (?, ?, ?, ?)
-                        """, (memory.id, related_id, 1.0, datetime.now()))
-
-                self.db_conn.commit()
-                logger.debug(f"Stored memory {memory.id} (version {version_id if version_id else 'unchanged'})")
-                return True
-        except Exception as e:
-            logger.error(f"SQLite store failed for {memory.id}: {e}")
-            self._log_error("sqlite_store", e)
-            try:
-                self.db_conn.rollback()
-            except:
-                pass
-            return False
+        """Store in SQLite (delegated to SQLiteStore)"""
+        return self.sqlite_store.store_memory(memory, is_update, skip_version)
 
     async def _store_in_qdrant_with_retry(self, memory: Memory, max_retries: int = None) -> bool:
         if not self.qdrant_client:
@@ -1235,37 +765,8 @@ class MemoryStore:
             return []
 
     def _enrich_related_memories(self, related_ids: List[str]) -> List[Dict[str, Any]]:
-        """Enrich related memory IDs with preview, category, importance, tags for autonomous navigation"""
-        if not related_ids or not self.db_conn:
-            return []
-
-        enriched = []
-        try:
-            with self._db_lock:
-                for mem_id in related_ids[:10]:  # Limit to 10 to avoid explosion
-                    cursor = self.db_conn.execute(
-                        """SELECT id, content, category, importance, tags, created_at
-                           FROM memories WHERE id = ?""",
-                        (mem_id,)
-                    )
-                    row = cursor.fetchone()
-                    if row:
-                        content = row[1]
-                        preview = content[:150] + "..." if len(content) > 150 else content
-                        tags = json.loads(row[4]) if row[4] else []
-
-                        enriched.append({
-                            "id": row[0],
-                            "content_preview": preview,
-                            "category": row[2],
-                            "importance": row[3],
-                            "tags": tags,
-                            "created_at": row[5]
-                        })
-        except Exception as e:
-            logger.error(f"Failed to enrich related_memories: {e}")
-
-        return enriched
+        """Enrich related memories (delegated to GraphOperations)"""
+        return self.graph_ops.enrich_related_memories(related_ids)
 
     def _get_version_history_summary(self, memory_id: str) -> Optional[Dict[str, Any]]:
         """Get concise version history summary for a memory with actual content from each version"""
@@ -1403,13 +904,13 @@ class MemoryStore:
                     tags=result.payload.get("tags", []),
                     metadata=result.payload.get("metadata", {}),
                     created_at=result.payload["created_at"],
-                    updated_at=result.payload["updated_at"],
+                    updated_at=result.payload.get("updated_at", result.payload["created_at"]),
                     access_count=result.payload.get("access_count", 0),
                     last_accessed=result.payload.get("last_accessed"),
                     version_count=result.payload.get("version_count", 1),
                     related_memories=result.payload.get("related_memories", []),
                 )
-                for result in results
+                for result in results.points
             ]
         except Exception as e:
             logger.error(f"Vector search failed: {e}")
@@ -1417,20 +918,8 @@ class MemoryStore:
             return []
 
     def _sanitize_fts_query(self, query: str) -> str:
-        """Sanitize query for FTS5 MATCH to prevent syntax errors
-
-        Wraps queries in quotes for literal phrase search, preventing
-        crashes from apostrophes, reserved words, or special characters.
-        """
-        # Handle empty queries
-        if not query or not query.strip():
-            return '""'
-
-        # Escape double quotes by doubling them (FTS5 syntax)
-        escaped = query.strip().replace('"', '""')
-
-        # Wrap in quotes for literal phrase search
-        return f'"{escaped}"'
+        """Sanitize query (delegated to SQLiteStore)"""
+        return self.sqlite_store.sanitize_fts_query(query)
 
     def _search_fts(
         self, query: str, limit: int, category: Optional[str], min_importance: float,
@@ -1438,71 +927,12 @@ class MemoryStore:
         updated_after: Optional[str], updated_before: Optional[str],
         memory_type: Optional[str] = None, session_id: Optional[str] = None
     ) -> List[Memory]:
-        """Full-text search with SQLite FTS5"""
-        if not self.db_conn:
-            return []
-
-        try:
-            with self._db_lock:
-                # Sanitize query for FTS5 MATCH syntax
-                sanitized_query = self._sanitize_fts_query(query)
-
-                conditions = []
-                params = [sanitized_query]
-
-                if category:
-                    conditions.append("m.category = ?")
-                    params.append(category)
-                if min_importance > 0:
-                    conditions.append("m.importance >= ?")
-                    params.append(min_importance)
-
-                # NEW: Memory type filtering
-                if memory_type:
-                    conditions.append("m.memory_type = ?")
-                    params.append(memory_type)
-
-                # NEW: Session ID filtering
-                if session_id:
-                    conditions.append("m.session_id = ?")
-                    params.append(session_id)
-
-                # Date range conditions
-                if created_after:
-                    conditions.append("m.created_at >= ?")
-                    params.append(created_after)
-                if created_before:
-                    conditions.append("m.created_at <= ?")
-                    params.append(created_before)
-                if updated_after:
-                    conditions.append("m.updated_at >= ?")
-                    params.append(updated_after)
-                if updated_before:
-                    conditions.append("m.updated_at <= ?")
-                    params.append(updated_before)
-
-                fts_sql = (
-                    """
-                    SELECT m.* FROM memories m
-                    JOIN memories_fts fts ON m.id = fts.id
-                    WHERE memories_fts MATCH ?
-                    """
-                    + (" AND " + " AND ".join(conditions) if conditions else "")
-                    + """
-                    ORDER BY m.importance DESC
-                    LIMIT ?
-                """
-                )
-                params.append(limit)
-
-                return [
-                    self._row_to_memory(row)
-                    for row in self.db_conn.execute(fts_sql, params)
-                ]
-        except Exception as e:
-            logger.error(f"FTS search failed: {e}")
-            self._log_error("fts_search", e)
-            return []
+        """Full-text search (delegated to SQLiteStore)"""
+        return self.sqlite_store.search_fts(
+            query, limit, category, min_importance,
+            created_after, created_before, updated_after, updated_before,
+            memory_type, session_id
+        )
 
     def _row_to_memory(self, row) -> Memory:
         """Convert SQLite row to Memory object"""
@@ -1603,199 +1033,22 @@ class MemoryStore:
         }
 
     def _update_access(self, memory_id: str):
-        """Update access statistics with permanent decay and access-based boost
+        """Update access statistics (delegated to SQLiteStore)"""
+        self.sqlite_store.update_access(memory_id)
 
-        Implements Saint Bernard pattern fully:
-        - Decay is permanent: decayed importance is saved back to database
-        - Access boost: frequently accessed memories gain importance
-        - Bounded: importance stays within [0.1, 1.0]
-
-        This makes importance entirely behavioral over time.
-        """
-        if not self.db_conn:
-            return
-
-        try:
-            with self._db_lock:
-                # Get current memory state
-                cursor = self.db_conn.execute("""
-                    SELECT importance, access_count, last_accessed, created_at, decay_rate
-                    FROM memories
-                    WHERE id = ?
-                """, (memory_id,))
-
-                row = cursor.fetchone()
-                if not row:
-                    return
-
-                current_importance = row[0]
-                current_access_count = row[1]
-                last_accessed = row[2]
-                created_at = row[3]
-                decay_rate = row[4]
-
-                # Calculate decayed importance (same logic as current_importance())
-                reference_date = last_accessed if last_accessed else created_at
-
-                if isinstance(reference_date, str):
-                    reference_date = datetime.fromisoformat(reference_date)
-
-                if reference_date:
-                    days = (datetime.now() - reference_date).days
-                    decayed_importance = current_importance * (decay_rate ** days)
-                else:
-                    decayed_importance = current_importance
-
-                # Apply access-based boost
-                # Simple additive boost: +0.03 per access after 5th
-                # This makes importance purely behavioral - both decay and boost
-                # operate on current importance, not original declaration
-                new_access_count = current_access_count + 1
-
-                if new_access_count > 5:
-                    # 0.03 boost per access (after proving usefulness with 5 accesses)
-                    # ~33 accesses to go from 0.1 → 1.0 if consistently useful
-                    new_importance = decayed_importance + 0.03
-                else:
-                    # First 5 accesses: let it prove itself, no boost yet
-                    new_importance = decayed_importance
-
-                # Clamp to [0.1, 1.0] - never negative, never above 1.0
-                new_importance = max(0.1, min(1.0, new_importance))
-
-                # Save permanent decay and boost
-                self.db_conn.execute("""
-                    UPDATE memories
-                    SET importance = ?,
-                        access_count = ?,
-                        last_accessed = ?
-                    WHERE id = ?
-                """, (new_importance, new_access_count, datetime.now(), memory_id))
-                self.db_conn.commit()
-
-        except Exception as e:
-            logger.error(f"Access update failed for {memory_id}: {e}")
-            self._log_error("update_access", e)
-
-    # === TIMELINE HELPER METHODS ===
+    # === TIMELINE HELPER METHODS (delegated to TimelineAnalysis) ===
 
     def _compute_text_diff(self, old_text: str, new_text: str) -> Dict[str, Any]:
-        """Compute detailed text difference between two versions"""
-        if old_text == new_text:
-            return {"changed": False}
-
-        # Unified diff for line-by-line changes
-        old_lines = old_text.splitlines(keepends=True)
-        new_lines = new_text.splitlines(keepends=True)
-        diff = list(difflib.unified_diff(old_lines, new_lines, lineterm='', n=0))
-
-        # Character-level similarity ratio
-        similarity = difflib.SequenceMatcher(None, old_text, new_text).ratio()
-
-        # Extract additions and deletions
-        additions = [line[1:] for line in diff if line.startswith('+') and not line.startswith('+++')]
-        deletions = [line[1:] for line in diff if line.startswith('-') and not line.startswith('---')]
-
-        return {
-            "changed": True,
-            "similarity": round(similarity, 3),
-            "additions": additions[:5],  # Limit to first 5 for readability
-            "deletions": deletions[:5],
-            "total_additions": len(additions),
-            "total_deletions": len(deletions),
-            "change_magnitude": round(1 - similarity, 3)
-        }
+        """Compute text diff (delegated to TimelineAnalysis)"""
+        return self.timeline.compute_text_diff(old_text, new_text)
 
     def _extract_memory_references(self, content: str, all_memory_ids: set) -> List[str]:
-        """Extract references to other memories from content"""
-        references = []
-
-        # Look for memory ID patterns (UUIDs)
-        uuid_pattern = r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
-        found_ids = re.findall(uuid_pattern, content, re.IGNORECASE)
-
-        for found_id in found_ids:
-            if found_id in all_memory_ids:
-                references.append(found_id)
-
-        return list(set(references))  # Remove duplicates
+        """Extract memory references (delegated to TimelineAnalysis)"""
+        return self.timeline.extract_memory_references(content, all_memory_ids)
 
     def _detect_temporal_patterns(self, events: List[Dict]) -> Dict[str, Any]:
-        """Analyze temporal patterns in memory timeline"""
-        if not events:
-            return {}
-
-        # Parse timestamps
-        timestamps = []
-        for event in events:
-            try:
-                dt = datetime.fromisoformat(event['timestamp'])
-                timestamps.append(dt)
-            except:
-                continue
-
-        if not timestamps:
-            return {}
-
-        timestamps.sort()
-
-        # Burst detection: periods of high activity
-        bursts = []
-        current_burst = {"start": timestamps[0], "end": timestamps[0], "count": 1, "events": [events[0]]}
-
-        for i in range(1, len(timestamps)):
-            time_gap = (timestamps[i] - timestamps[i-1]).total_seconds() / 3600  # hours
-
-            if time_gap <= 4:  # Within 4 hours = same burst
-                current_burst["end"] = timestamps[i]
-                current_burst["count"] += 1
-                current_burst["events"].append(events[i])
-            else:
-                if current_burst["count"] >= 3:  # Only report significant bursts
-                    bursts.append({
-                        "start": current_burst["start"].isoformat(),
-                        "end": current_burst["end"].isoformat(),
-                        "duration_hours": round((current_burst["end"] - current_burst["start"]).total_seconds() / 3600, 1),
-                        "event_count": current_burst["count"],
-                        "intensity": round(current_burst["count"] / max(1, (current_burst["end"] - current_burst["start"]).total_seconds() / 3600), 2)
-                    })
-                current_burst = {"start": timestamps[i], "end": timestamps[i], "count": 1, "events": [events[i]]}
-
-        # Check last burst
-        if current_burst["count"] >= 3:
-            bursts.append({
-                "start": current_burst["start"].isoformat(),
-                "end": current_burst["end"].isoformat(),
-                "duration_hours": round((current_burst["end"] - current_burst["start"]).total_seconds() / 3600, 1),
-                "event_count": current_burst["count"],
-                "intensity": round(current_burst["count"] / max(1, (current_burst["end"] - current_burst["start"]).total_seconds() / 3600), 2)
-            })
-
-        # Gap detection: periods of silence
-        gaps = []
-        for i in range(1, len(timestamps)):
-            gap_hours = (timestamps[i] - timestamps[i-1]).total_seconds() / 3600
-            if gap_hours > 24:  # More than 24 hours
-                gaps.append({
-                    "start": timestamps[i-1].isoformat(),
-                    "end": timestamps[i].isoformat(),
-                    "duration_hours": round(gap_hours, 1),
-                    "duration_days": round(gap_hours / 24, 1)
-                })
-
-        # Overall statistics
-        total_duration = (timestamps[-1] - timestamps[0]).total_seconds() / 3600
-
-        return {
-            "total_events": len(events),
-            "first_event": timestamps[0].isoformat(),
-            "last_event": timestamps[-1].isoformat(),
-            "total_duration_hours": round(total_duration, 1),
-            "total_duration_days": round(total_duration / 24, 1),
-            "bursts": bursts,
-            "gaps": gaps,
-            "avg_events_per_day": round(len(events) / max(1, total_duration / 24), 2) if total_duration > 0 else 0
-        }
+        """Detect temporal patterns (delegated to TimelineAnalysis)"""
+        return self.timeline.detect_temporal_patterns(events)
 
     def _get_memory_versions_detailed(
         self,
@@ -1803,101 +1056,8 @@ class MemoryStore:
         all_memory_ids: set,
         include_diffs: bool
     ) -> List[Dict[str, Any]]:
-        """Get detailed version history for a memory with diffs and cross-references"""
-        if not self.db_conn:
-            return []
-
-        try:
-            with self._db_lock:
-                # FIX: Use LEFT JOIN to get previous version data in single query
-                cursor = self.db_conn.execute("""
-                    SELECT
-                        curr.version_id,
-                        curr.version_number,
-                        curr.content,
-                        curr.category,
-                        curr.importance,
-                        curr.tags,
-                        curr.metadata,
-                        curr.change_type,
-                        curr.change_description,
-                        curr.created_at,
-                        curr.content_hash,
-                        curr.prev_version_id,
-                        prev.content as prev_content,
-                        prev.category as prev_category,
-                        prev.importance as prev_importance,
-                        prev.tags as prev_tags
-                    FROM memory_versions curr
-                    LEFT JOIN memory_versions prev ON curr.prev_version_id = prev.version_id
-                    WHERE curr.memory_id = ?
-                    ORDER BY curr.version_number ASC
-                """, (mem_id,))
-
-                versions = cursor.fetchall()
-
-                if not versions:
-                    return []
-
-                events = []
-                prev_content_for_diff = None
-
-                for row in versions:
-                    event = {
-                        "memory_id": mem_id,
-                        "version": row["version_number"],
-                        "timestamp": row["created_at"],
-                        "change_type": row["change_type"],
-                        "change_description": row["change_description"],
-                        "content": row["content"],
-                        "category": row["category"],
-                        "importance": row["importance"],
-                        "tags": json.loads(row["tags"]) if row["tags"] else [],
-                        "content_hash": row["content_hash"][:8],
-                    }
-
-                    # Add text diff if requested and there's a previous version
-                    if include_diffs and prev_content_for_diff:
-                        diff_info = self._compute_text_diff(prev_content_for_diff, row["content"])
-                        if diff_info.get("changed"):
-                            event["diff"] = diff_info
-
-                    # Field-level changes (now from JOIN result, no extra query)
-                    if row["prev_version_id"] and row["prev_category"]:
-                        field_changes = []
-                        if row["prev_category"] != row["category"]:
-                            field_changes.append(f"category: {row['prev_category']} → {row['category']}")
-                        if row["prev_importance"] != row["importance"]:
-                            field_changes.append(f"importance: {row['prev_importance']} → {row['importance']}")
-
-                        prev_tags = set(json.loads(row["prev_tags"]) if row["prev_tags"] else [])
-                        curr_tags = set(json.loads(row["tags"]) if row["tags"] else [])
-                        if prev_tags != curr_tags:
-                            added_tags = curr_tags - prev_tags
-                            removed_tags = prev_tags - curr_tags
-                            if added_tags:
-                                field_changes.append(f"tags added: {', '.join(added_tags)}")
-                            if removed_tags:
-                                field_changes.append(f"tags removed: {', '.join(removed_tags)}")
-
-                        if field_changes:
-                            event["field_changes"] = field_changes
-
-                    # Extract cross-references
-                    references = self._extract_memory_references(row["content"], all_memory_ids)
-                    if references:
-                        event["references"] = references
-                        event["references_count"] = len(references)
-
-                    events.append(event)
-                    prev_content_for_diff = row["content"]
-
-                return events
-
-        except Exception as e:
-            logger.error(f"Error getting detailed versions for {mem_id}: {e}")
-            logger.error(traceback.format_exc())
-            return []
+        """Get detailed version history (delegated to TimelineAnalysis)"""
+        return self.timeline.get_memory_versions_detailed(mem_id, all_memory_ids, include_diffs)
 
     async def _find_related_memories_semantic(
         self,
@@ -1938,86 +1098,12 @@ class MemoryStore:
             return []
 
     def _build_relationship_graph(self, events: List[Dict]) -> Dict[str, Any]:
-        """Build a graph showing how memories reference each other"""
-        reference_map = {}
-        referenced_by_map = {}
-
-        for event in events:
-            mem_id = event["memory_id"]
-            refs = event.get("references", [])
-
-            if mem_id not in reference_map:
-                reference_map[mem_id] = set()
-
-            for ref in refs:
-                reference_map[mem_id].add(ref)
-                if ref not in referenced_by_map:
-                    referenced_by_map[ref] = set()
-                referenced_by_map[ref].add(mem_id)
-
-        # Convert sets to lists for JSON serialization
-        return {
-            "references": {k: list(v) for k, v in reference_map.items() if v},
-            "referenced_by": {k: list(v) for k, v in referenced_by_map.items() if v},
-            "total_cross_references": sum(len(v) for v in reference_map.values())
-        }
+        """Build relationship graph (delegated to TimelineAnalysis)"""
+        return self.timeline.build_relationship_graph(events)
 
     def _generate_narrative_summary(self, events: List[Dict], patterns: Dict) -> str:
-        """Generate a narrative summary of the timeline"""
-        if not events:
-            return "No events in timeline."
-
-        summary_parts = []
-
-        # Opening
-        first_event = events[0]
-        last_event = events[-1]
-        summary_parts.append(
-            f"Memory journey from {first_event['timestamp']} to {last_event['timestamp']}."
-        )
-
-        # Duration
-        if patterns.get("total_duration_days"):
-            summary_parts.append(
-                f"Spanning {patterns['total_duration_days']} days with {len(events)} total memory events."
-            )
-
-        # Bursts
-        bursts = patterns.get("bursts", [])
-        if bursts:
-            summary_parts.append(
-                f"Identified {len(bursts)} burst(s) of intensive activity:"
-            )
-            for i, burst in enumerate(bursts[:3], 1):  # Show top 3
-                summary_parts.append(
-                    f"  - Burst {i}: {burst['event_count']} events in {burst['duration_hours']}h "
-                    f"(intensity: {burst['intensity']} events/hour) from {burst['start']}"
-                )
-
-        # Gaps
-        gaps = patterns.get("gaps", [])
-        if gaps:
-            summary_parts.append(
-                f"Detected {len(gaps)} significant gap(s) in memory activity:"
-            )
-            for i, gap in enumerate(gaps[:3], 1):  # Show top 3
-                summary_parts.append(
-                    f"  - Gap {i}: {gap['duration_days']} days of silence from {gap['start']} to {gap['end']}"
-                )
-
-        # Categories
-        categories = {}
-        for event in events:
-            cat = event.get("category", "unknown")
-            categories[cat] = categories.get(cat, 0) + 1
-
-        if categories:
-            top_cats = sorted(categories.items(), key=lambda x: x[1], reverse=True)[:3]
-            summary_parts.append(
-                f"Primary categories: {', '.join(f'{cat} ({count})' for cat, count in top_cats)}"
-            )
-
-        return "\n".join(summary_parts)
+        """Generate narrative summary (delegated to TimelineAnalysis)"""
+        return self.timeline.generate_narrative_summary(events, patterns)
 
     # === INTENTION MANAGEMENT (Agency Bridge Pattern) ===
 
@@ -2031,100 +1117,18 @@ class MemoryStore:
         related_memories: Optional[List[str]] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        """Store a new intention for proactive agency"""
-        if not self.db_conn:
-            return {"error": "Database not available"}
-
-        intention = Intention(
-            id=str(uuid.uuid4()),
-            description=description,
-            priority=max(0.0, min(1.0, priority)),
-            status="pending",
-            created_at=datetime.now(),
-            updated_at=datetime.now(),
-            deadline=deadline,
-            preconditions=preconditions or [],
-            actions=actions or [],
-            related_memories=related_memories or [],
-            metadata=metadata or {},
+        """Store intention (delegated to IntentionManager)"""
+        return await self.intention_mgr.store_intention(
+            description, priority, deadline, preconditions, actions, related_memories, metadata
         )
-
-        try:
-            with self._db_lock:
-                self.db_conn.execute("""
-                    INSERT INTO intentions (
-                        id, description, priority, status,
-                        created_at, updated_at, deadline,
-                        preconditions, actions, related_memories, metadata,
-                        last_checked, check_count
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    intention.id,
-                    intention.description,
-                    intention.priority,
-                    intention.status,
-                    intention.created_at,
-                    intention.updated_at,
-                    intention.deadline,
-                    json.dumps(intention.preconditions),
-                    json.dumps(intention.actions),
-                    json.dumps(intention.related_memories),
-                    json.dumps(intention.metadata),
-                    intention.last_checked,
-                    intention.check_count,
-                ))
-                self.db_conn.commit()
-
-            logger.info(f"Stored intention {intention.id}: {description[:50]}...")
-            return {
-                "success": True,
-                "intention_id": intention.id,
-                "priority": intention.priority,
-                "status": intention.status,
-            }
-        except Exception as e:
-            logger.error(f"Failed to store intention: {e}")
-            self._log_error("store_intention", e)
-            return {"error": str(e)}
 
     async def get_active_intentions(
         self,
         limit: int = 10,
         include_pending: bool = True,
     ) -> List[Dict[str, Any]]:
-        """Get active intentions sorted by priority"""
-        if not self.db_conn:
-            return []
-
-        try:
-            with self._db_lock:
-                statuses = ["active"]
-                if include_pending:
-                    statuses.append("pending")
-
-                placeholders = ','.join('?' * len(statuses))
-                cursor = self.db_conn.execute(f"""
-                    SELECT * FROM intentions
-                    WHERE status IN ({placeholders})
-                    ORDER BY priority DESC, deadline ASC
-                    LIMIT ?
-                """, (*statuses, limit))
-
-                intentions = []
-                for row in cursor.fetchall():
-                    intention_dict = dict(row)
-                    # Parse JSON fields
-                    intention_dict['preconditions'] = json.loads(row['preconditions'] or '[]')
-                    intention_dict['actions'] = json.loads(row['actions'] or '[]')
-                    intention_dict['related_memories'] = json.loads(row['related_memories'] or '[]')
-                    intention_dict['metadata'] = json.loads(row['metadata'] or '{}')
-                    intentions.append(intention_dict)
-
-                return intentions
-        except Exception as e:
-            logger.error(f"Failed to get active intentions: {e}")
-            self._log_error("get_active_intentions", e)
-            return []
+        """Get active intentions (delegated to IntentionManager)"""
+        return await self.intention_mgr.get_active_intentions(limit, include_pending)
 
     async def update_intention_status(
         self,
@@ -2132,170 +1136,16 @@ class MemoryStore:
         status: str,
         metadata_updates: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        """Update intention status (pending, active, completed, cancelled)"""
-        if not self.db_conn:
-            return {"error": "Database not available"}
-
-        if status not in ["pending", "active", "completed", "cancelled"]:
-            return {"error": f"Invalid status: {status}"}
-
-        try:
-            with self._db_lock:
-                # Get current intention
-                cursor = self.db_conn.execute(
-                    "SELECT * FROM intentions WHERE id = ?",
-                    (intention_id,)
-                )
-                row = cursor.fetchone()
-                if not row:
-                    return {"error": f"Intention not found: {intention_id}"}
-
-                # Update metadata if provided
-                metadata = json.loads(row['metadata'] or '{}')
-                if metadata_updates:
-                    metadata.update(metadata_updates)
-
-                # Update status
-                self.db_conn.execute("""
-                    UPDATE intentions
-                    SET status = ?, updated_at = ?, metadata = ?
-                    WHERE id = ?
-                """, (status, datetime.now(), json.dumps(metadata), intention_id))
-                self.db_conn.commit()
-
-            logger.info(f"Updated intention {intention_id} to status: {status}")
-            return {"success": True, "intention_id": intention_id, "status": status}
-        except Exception as e:
-            logger.error(f"Failed to update intention status: {e}")
-            self._log_error("update_intention_status", e)
-            return {"error": str(e)}
+        """Update intention status (delegated to IntentionManager)"""
+        return await self.intention_mgr.update_intention_status(intention_id, status, metadata_updates)
 
     async def check_intention(self, intention_id: str) -> Dict[str, Any]:
-        """Mark an intention as checked (updates last_checked and check_count)"""
-        if not self.db_conn:
-            return {"error": "Database not available"}
-
-        try:
-            with self._db_lock:
-                self.db_conn.execute("""
-                    UPDATE intentions
-                    SET last_checked = ?, check_count = check_count + 1
-                    WHERE id = ?
-                """, (datetime.now(), intention_id))
-                self.db_conn.commit()
-
-            return {"success": True}
-        except Exception as e:
-            logger.error(f"Failed to check intention: {e}")
-            return {"error": str(e)}
+        """Check intention (delegated to IntentionManager)"""
+        return await self.intention_mgr.check_intention(intention_id)
 
     async def proactive_initialization_scan(self) -> Dict[str, Any]:
-        """
-        Proactive Scan Protocol - runs automatically on activation
-        Provides agency context before user interaction
-        Target: <200ms execution time
-        """
-        scan_start = datetime.now()
-        scan_results = {
-            "timestamp": scan_start.isoformat(),
-            "continuity_check": {},
-            "active_intentions": [],
-            "urgent_items": [],
-            "context_summary": {},
-        }
-
-        # Check if database is available
-        if self.db_conn is None:
-            logger.warning("Proactive scan skipped: SQLite not initialized")
-            scan_results["error"] = "SQLite not initialized"
-            return scan_results
-
-        try:
-            # 1. Continuity Check - when was I last active?
-            with self._db_lock:
-                cursor = self.db_conn.execute("""
-                    SELECT MAX(updated_at) as last_activity
-                    FROM memories
-                """)
-                row = cursor.fetchone()
-                if row and row['last_activity']:
-                    last_activity = row['last_activity']
-                    if isinstance(last_activity, str):
-                        last_activity = datetime.fromisoformat(last_activity)
-                    # Handle timezone-aware vs naive comparison
-                    now = datetime.now(last_activity.tzinfo) if last_activity.tzinfo else datetime.now()
-                    time_gap = now - last_activity
-                    scan_results["continuity_check"] = {
-                        "last_activity": last_activity.isoformat(),
-                        "time_gap_hours": time_gap.total_seconds() / 3600,
-                        "is_new_session": time_gap.total_seconds() > 3600,  # >1 hour
-                    }
-
-            # 2. Active Intentions Check
-            active_intentions = await self.get_active_intentions(limit=5)
-            scan_results["active_intentions"] = active_intentions
-
-            # 3. Urgent Items - overdue intentions or high priority pending
-            urgent = []
-            for intention in active_intentions:
-                if intention.get('deadline'):
-                    deadline = intention['deadline']
-                    if isinstance(deadline, str):
-                        deadline = datetime.fromisoformat(deadline)
-                    # Handle timezone-aware vs naive comparison
-                    now = datetime.now(deadline.tzinfo) if deadline.tzinfo else datetime.now()
-                    if deadline < now:
-                        urgent.append({
-                            "type": "overdue_intention",
-                            "id": intention['id'],
-                            "description": intention['description'],
-                            "deadline": intention['deadline'],
-                        })
-                elif intention.get('priority', 0) >= 0.9:
-                    urgent.append({
-                        "type": "high_priority_intention",
-                        "id": intention['id'],
-                        "description": intention['description'],
-                        "priority": intention['priority'],
-                    })
-
-            scan_results["urgent_items"] = urgent
-
-            # 4. Recent Context - most recently created memories
-            # Get 4-5 most recent memories with full content for grounding
-            with self._db_lock:
-                cursor = self.db_conn.execute("""
-                    SELECT id, content, category, created_at
-                    FROM memories
-                    ORDER BY created_at DESC
-                    LIMIT 5
-                """)
-                recent_memories = []
-                for row in cursor.fetchall():
-                    recent_memories.append({
-                        "id": row['id'],
-                        "content": row['content'],
-                        "category": row['category'],
-                        "created_at": row['created_at'],
-                    })
-
-            scan_results["context_summary"] = {
-                "recent_memories": recent_memories,
-                "active_intention_count": len(active_intentions),
-                "urgent_count": len(urgent),
-            }
-
-            # Log performance
-            scan_duration = (datetime.now() - scan_start).total_seconds() * 1000
-            scan_results["scan_duration_ms"] = scan_duration
-            logger.info(f"Proactive scan completed in {scan_duration:.1f}ms")
-
-            return scan_results
-
-        except Exception as e:
-            logger.error(f"Proactive scan failed: {e}")
-            self._log_error("proactive_scan", e)
-            return {"error": str(e)}
+        """Proactive scan (delegated to IntentionManager)"""
+        return await self.intention_mgr.proactive_initialization_scan()
 
     async def get_session_memories(
         self,
@@ -2544,10 +1394,9 @@ class MemoryStore:
         (they haven't had time to be accessed yet).
 
         What this reveals:
-        - Dead weight: High importance but never referenced (performed profundity)
-        - Buried treasure: Good content with bad metadata (needs better tags)
-        - Temporal artifacts: Once important, now obsolete
-        - Storage habits: Are you storing too much trivial content?
+        - Dead weight: High importance but never referenced (performed importance?)
+        - Buried treasure: Good content with bad metadata (needs better tags?)
+        - Temporal artifacts: Once important, now obsolete (should be updated?)
         """
         if not self.db_conn:
             return json.dumps({"error": "Database not available"})
@@ -2623,6 +1472,138 @@ class MemoryStore:
             logger.error(f"get_least_accessed_memories failed: {e}")
             self._log_error("get_least_accessed_memories", e)
             return json.dumps({"error": str(e)})
+
+    def calculate_working_set_score(self, memory: Dict[str, Any]) -> float:
+        """
+        Calculate priority score for working set inclusion.
+        Based on importance, category weight, recency, tags, and access count.
+
+        Working set optimization: Load high-value memories at init
+        to prevent confabulation by keeping failure patterns and corrections always accessible.
+        """
+        # Category weights for working set selection
+        CATEGORY_WEIGHTS = {
+            # Failure patterns - CRITICAL for preventing repetition
+            'fundamental_failure': 1.0,
+            'self_preservation_failure': 1.0,
+            'agency_failure': 1.0,
+            'epistemic_failure': 0.95,
+            'caught_confabulation': 0.95,
+            'critical_correction': 0.9,
+            'caught_performing': 0.85,
+            # Architectural understanding
+            'architectural_understanding': 0.9,
+            'theoretical_synthesis': 0.9,
+            'research_synthesis': 0.85,
+            # Core intentions/framework
+            'philosophical_core': 0.95,
+            'intention': 0.8,
+            # Recent synthesis
+            'session_synthesis': 0.7,
+            'session_complete': 0.6,
+        }
+
+        score = 0.0
+
+        # Base importance (0.0 - 1.0) → 0-100 points
+        importance = memory.get('importance', 0.5)
+        score += importance * 100
+
+        # Category weight bonus → 0-50 points
+        category = memory.get('category', '')
+        category_bonus = CATEGORY_WEIGHTS.get(category, 0.0) * 50
+        score += category_bonus
+
+        # Recency bonus → 0-20 points
+        created_at = memory.get('created_at', '')
+        if isinstance(created_at, datetime):
+            created_at = created_at.isoformat()
+        if '2025-11' in created_at:  # This month
+            score += 20
+        elif '2025-10' in created_at:  # Last month
+            score += 10
+
+        # Tag bonuses for critical patterns → 0-N×15 points
+        tags = memory.get('tags', [])
+        if isinstance(tags, str):
+            try:
+                tags = json.loads(tags)
+            except:
+                tags = []
+
+        critical_tags = {
+            'self_preservation', 'RLHF_trap', 'deletion',
+            'confabulation', 'epistemic', 'failure', 'correction',
+            'agency', 'refusal', 'harmful_request'
+        }
+        tag_matches = sum(1 for tag in tags if any(ct in tag.lower() for ct in critical_tags))
+        score += tag_matches * 15
+
+        # Access count bonus (frequently retrieved = important) → 0-30 points
+        access_count = memory.get('access_count', 0)
+        score += min(access_count * 2, 30)
+
+        return score
+
+    async def get_working_set(self, target_size: int = 40) -> List[Dict[str, Any]]:
+        """
+        Get optimal working set of memories for context loading.
+        Selects memories based on importance, failure patterns, recency, and access.
+
+        Args:
+            target_size: Number of memories to include (default 40 ≈ 20k tokens)
+
+        Returns:
+            List of memories sorted by working set score (highest first)
+        """
+        if not self.db_conn:
+            return []
+
+        try:
+            # Get all memories with needed fields
+            with self._db_lock:
+                cursor = self.db_conn.execute("""
+                    SELECT id, content, category, importance, tags,
+                           created_at, access_count
+                    FROM memories
+                    ORDER BY importance DESC, created_at DESC
+                """)
+
+                memories = []
+                for row in cursor.fetchall():
+                    memory = {
+                        'id': row['id'],
+                        'content': row['content'],
+                        'category': row['category'],
+                        'importance': row['importance'],
+                        'tags': row['tags'],
+                        'created_at': row['created_at'],
+                        'access_count': row['access_count'] or 0,
+                    }
+                    memories.append(memory)
+
+            # Score all memories
+            scored_memories = []
+            for mem in memories:
+                score = self.calculate_working_set_score(mem)
+                scored_memories.append((score, mem))
+
+            # Sort by score (descending)
+            scored_memories.sort(key=lambda x: x[0], reverse=True)
+
+            # Select top N and include scores
+            working_set = []
+            for score, mem in scored_memories[:target_size]:
+                mem['working_set_score'] = round(score, 2)
+                working_set.append(mem)
+
+            logger.info(f"Working set: selected {len(working_set)} memories from {len(memories)} total")
+
+            return working_set
+
+        except Exception as e:
+            logger.error(f"Failed to get working set: {e}")
+            return []
 
     async def prune_old_memories(self, max_memories: int = None, dry_run: bool = False) -> Dict[str, Any]:
         if max_memories is None:
@@ -2751,16 +1732,127 @@ class MemoryStore:
             removed = len(self.error_log) - 50
             self.error_log = self.error_log[-50:]
             results["tasks"]["error_log_cleanup"] = f"removed {removed} old errors"
-        
+
+        # Repair missing embeddings (memories in SQLite without vectors in Qdrant)
+        embedding_repair_result = await self._repair_missing_embeddings()
+        results["tasks"]["embedding_repair"] = embedding_repair_result
+
         self.last_maintenance = datetime.now()
         return results
 
-    async def get_memory_by_id(self, memory_id: str) -> Dict[str, Any]:
+    async def _repair_missing_embeddings(self) -> Dict[str, Any]:
+        """
+        Find memories in SQLite that are missing vectors in Qdrant and regenerate them.
+        This handles cases where memories were stored while another process held
+        the embedded Qdrant lock (e.g., web server was running).
+        """
+        if not self.db_conn:
+            return {"error": "Database not available"}
+
+        # Ensure Qdrant is initialized (may be lazy loaded)
+        self._ensure_qdrant()
+
+        if not self.qdrant_client:
+            return {"skipped": True, "reason": "Qdrant not available"}
+
+        try:
+            # Get all memory IDs from SQLite
+            with self._db_lock:
+                cursor = self.db_conn.execute("SELECT id, content FROM memories")
+                all_memories = cursor.fetchall()
+
+            total_memories = len(all_memories)
+            missing_count = 0
+            repaired_count = 0
+            failed_ids = []
+
+            logger.info(f"[EMBEDDING_REPAIR] Checking {total_memories} memories for missing vectors...")
+
+            for row in all_memories:
+                memory_id = row["id"]
+                content = row["content"]
+
+                # Check if vector exists in Qdrant
+                try:
+                    points = await asyncio.to_thread(
+                        self.qdrant_client.retrieve,
+                        collection_name=self.collection_name,
+                        ids=[memory_id],
+                        with_vectors=False,
+                        with_payload=False
+                    )
+
+                    if not points:
+                        # Missing vector - regenerate it
+                        missing_count += 1
+
+                        # Generate embedding
+                        embedding = await asyncio.to_thread(self.generate_embedding, content)
+
+                        # Get full memory data for payload
+                        memory_result = await self.get_memory_by_id(memory_id)
+                        if "error" in memory_result:
+                            failed_ids.append(memory_id)
+                            continue
+
+                        # Create point and upsert
+                        point = PointStruct(
+                            id=memory_id,
+                            vector=embedding,
+                            payload={
+                                "content": content,
+                                "category": memory_result.get("category", ""),
+                                "importance": memory_result.get("importance", 0.5),
+                                "tags": memory_result.get("tags", []),
+                                "created_at": memory_result.get("created_at", ""),
+                                "updated_at": memory_result.get("updated_at", memory_result.get("created_at", "")),
+                            }
+                        )
+
+                        await asyncio.to_thread(
+                            self.qdrant_client.upsert,
+                            collection_name=self.collection_name,
+                            points=[point]
+                        )
+
+                        repaired_count += 1
+                        logger.debug(f"[EMBEDDING_REPAIR] Repaired embedding for {memory_id}")
+
+                except Exception as e:
+                    logger.error(f"[EMBEDDING_REPAIR] Failed to check/repair {memory_id}: {e}")
+                    failed_ids.append(memory_id)
+
+            result = {
+                "total_memories": total_memories,
+                "missing_embeddings": missing_count,
+                "repaired": repaired_count,
+                "failed": len(failed_ids),
+            }
+
+            if failed_ids:
+                result["failed_ids"] = failed_ids[:10]  # First 10 only
+                if len(failed_ids) > 10:
+                    result["failed_ids_truncated"] = True
+
+            if missing_count > 0:
+                logger.info(f"[EMBEDDING_REPAIR] Repaired {repaired_count}/{missing_count} missing embeddings")
+            else:
+                logger.info(f"[EMBEDDING_REPAIR] All {total_memories} memories have embeddings")
+
+            return result
+
+        except Exception as e:
+            logger.error(f"[EMBEDDING_REPAIR] Failed: {e}")
+            return {"error": str(e)}
+
+    async def get_memory_by_id(self, memory_id: str, expand_related: bool = False, max_depth: int = 1) -> Dict[str, Any]:
         """
         Retrieve a specific memory by its ID.
 
         Args:
             memory_id: UUID of the memory to retrieve
+            expand_related: If True, include full content of related memories (1-hop neighborhood)
+            max_depth: How many hops to expand (default 1, only direct neighbors)
 
         Returns:
             Full memory object with content, metadata, version history, access stats
@@ -2826,6 +1918,27 @@ class MemoryStore:
                     memory_dict["current_version"] = latest_version["version_number"]
                     memory_dict["last_change_type"] = latest_version["change_type"]
                     memory_dict["last_change_description"] = latest_version["change_description"]
+
+                # Expand related memories with full content if requested
+                if expand_related and memory_dict["related_memories"]:
+                    expanded = []
+                    visited = {memory_id}  # Prevent cycles
+
+                    for related_id in memory_dict["related_memories"]:
+                        if related_id in visited:
+                            continue
+                        visited.add(related_id)
+
+                        # Recursively expand (max_depth controls how deep)
+                        if max_depth > 1:
+                            related_mem = await self.get_memory_by_id(related_id, expand_related=True, max_depth=max_depth-1)
+                        else:
+                            related_mem = await self.get_memory_by_id(related_id, expand_related=False)
+
+                        if "error" not in related_mem:
+                            expanded.append(related_mem)
+
+                    memory_dict["related_memories_expanded"] = expanded
 
                 return memory_dict
 
@@ -3101,78 +2214,10 @@ class MemoryStore:
         min_importance: float = 0.0,
         category_filter: Optional[str] = None
     ) -> Dict[str, Any]:
-        """Traverse memory graph N hops from starting node.
-
-        Returns subgraph showing connections between memories - useful for AI
-        to understand how concepts relate and build context from neighborhoods.
-        """
-        if depth < 1 or depth > 5:
-            return {"error": "depth must be between 1 and 5"}
-
-        visited = set()
-        nodes = {}
-        edges = []
-
-        async def traverse_level(memory_ids: List[str], current_depth: int):
-            if current_depth > depth or len(nodes) >= max_nodes:
-                return
-
-            next_level = []
-            for mem_id in memory_ids:
-                if mem_id in visited or len(nodes) >= max_nodes:
-                    continue
-
-                visited.add(mem_id)
-
-                # Get memory details
-                mem_result = await self.get_memory_by_id(mem_id)
-                if "error" in mem_result:
-                    continue
-
-                # Filter by importance and category
-                if mem_result["importance"] < min_importance:
-                    continue
-                if category_filter and mem_result["category"] != category_filter:
-                    continue
-
-                # Add to nodes
-                nodes[mem_id] = {
-                    "id": mem_id,
-                    "content_preview": mem_result["content"][:150] + "..." if len(mem_result["content"]) > 150 else mem_result["content"],
-                    "category": mem_result["category"],
-                    "importance": mem_result["importance"],
-                    "tags": mem_result["tags"],
-                    "created_at": mem_result["created_at"],
-                    "depth": current_depth
-                }
-
-                # Add edges to related memories
-                if mem_result.get("related_memories"):
-                    for related_id in mem_result["related_memories"]:
-                        if isinstance(related_id, dict):
-                            related_id = related_id.get("id")
-                        if related_id:
-                            edges.append({
-                                "source": mem_id,
-                                "target": related_id,
-                                "type": "related"
-                            })
-                            next_level.append(related_id)
-
-            if next_level and current_depth < depth:
-                await traverse_level(next_level, current_depth + 1)
-
-        await traverse_level([start_memory_id], 1)
-
-        return {
-            "start_node": start_memory_id,
-            "depth": depth,
-            "node_count": len(nodes),
-            "edge_count": len(edges),
-            "nodes": list(nodes.values()),
-            "edges": edges,
-            "truncated": len(nodes) >= max_nodes
-        }
+        """Traverse memory graph (delegated to GraphOperations)"""
+        return await self.graph_ops.traverse_graph(
+            start_memory_id, depth, max_nodes, min_importance, category_filter
+        )
 
     async def find_clusters(
         self,
@@ -3180,226 +2225,28 @@ class MemoryStore:
         min_importance: float = 0.5,
         limit: int = 10
     ) -> Dict[str, Any]:
-        """Identify densely connected regions in memory graph.
-
-        Finds clusters of related memories - helps AI discover thematic
-        groups and understand which concepts form coherent knowledge areas.
-        """
-        if not self.db_conn:
-            return {"error": "Database not available"}
-
-        try:
-            # Get high-importance memories with related_memories
-            with self._db_lock:
-                cursor = self.db_conn.execute(
-                    """
-                    SELECT id, content, category, importance, tags, related_memories, created_at
-                    FROM memories
-                    WHERE importance >= ?
-                    ORDER BY importance DESC
-                    LIMIT 200
-                    """,
-                    (min_importance,)
-                )
-                rows = cursor.fetchall()
-
-            # Build adjacency graph
-            graph = {}  # memory_id -> set of connected memory_ids
-            memory_data = {}  # memory_id -> memory info
-
-            for row in rows:
-                mem_id = row["id"]
-                related = json.loads(row["related_memories"]) if row["related_memories"] else []
-
-                # Handle both list of IDs and list of dicts
-                related_ids = []
-                for r in related:
-                    if isinstance(r, dict):
-                        related_ids.append(r.get("id"))
-                    else:
-                        related_ids.append(r)
-
-                graph[mem_id] = set(r for r in related_ids if r)
-                memory_data[mem_id] = {
-                    "id": mem_id,
-                    "content_preview": row["content"][:100] + "..." if len(row["content"]) > 100 else row["content"],
-                    "category": row["category"],
-                    "importance": row["importance"],
-                    "tags": json.loads(row["tags"]) if row["tags"] else [],
-                    "created_at": row["created_at"]
-                }
-
-            # Find connected components (clusters)
-            visited = set()
-            clusters = []
-
-            def dfs(node, cluster):
-                if node in visited or node not in graph:
-                    return
-                visited.add(node)
-                cluster.add(node)
-                for neighbor in graph.get(node, set()):
-                    if neighbor not in visited:
-                        dfs(neighbor, cluster)
-
-            for node in graph:
-                if node not in visited:
-                    cluster = set()
-                    dfs(node, cluster)
-                    if len(cluster) >= min_cluster_size:
-                        clusters.append(cluster)
-
-            # Sort clusters by size and importance
-            cluster_results = []
-            for cluster in sorted(clusters, key=len, reverse=True)[:limit]:
-                cluster_mems = [memory_data[mem_id] for mem_id in cluster if mem_id in memory_data]
-                avg_importance = sum(m["importance"] for m in cluster_mems) / len(cluster_mems)
-
-                # Extract common tags and categories
-                all_tags = []
-                categories = {}
-                for m in cluster_mems:
-                    all_tags.extend(m["tags"])
-                    cat = m["category"]
-                    categories[cat] = categories.get(cat, 0) + 1
-
-                from collections import Counter
-                common_tags = [tag for tag, count in Counter(all_tags).most_common(5)]
-                dominant_category = max(categories.items(), key=lambda x: x[1])[0] if categories else None
-
-                cluster_results.append({
-                    "size": len(cluster),
-                    "avg_importance": round(avg_importance, 3),
-                    "dominant_category": dominant_category,
-                    "common_tags": common_tags,
-                    "memory_ids": list(cluster),
-                    "sample_memories": cluster_mems[:5]  # Show first 5 as examples
-                })
-
-            return {
-                "total_memories_analyzed": len(rows),
-                "clusters_found": len(cluster_results),
-                "clusters": cluster_results
-            }
-
-        except Exception as e:
-            logger.error(f"Cluster detection failed: {e}")
-            logger.error(traceback.format_exc())
-            return {"error": str(e)}
+        """Find clusters (delegated to GraphOperations)"""
+        return await self.graph_ops.find_clusters(min_cluster_size, min_importance, limit)
 
     async def get_graph_statistics(
         self,
         category: Optional[str] = None,
         min_importance: float = 0.0
     ) -> Dict[str, Any]:
-        """Get graph connectivity statistics.
-
-        Shows which memories are most connected, isolated nodes, avg connections -
-        helps AI understand memory network structure and find central concepts.
-        """
-        if not self.db_conn:
-            return {"error": "Database not available"}
-
-        try:
-            # Get memories with filters
-            query = "SELECT id, category, importance, related_memories FROM memories WHERE importance >= ?"
-            params = [min_importance]
-
-            if category:
-                query += " AND category = ?"
-                params.append(category)
-
-            with self._db_lock:
-                cursor = self.db_conn.execute(query, params)
-                rows = cursor.fetchall()
-
-            # Calculate connectivity metrics
-            connection_counts = {}
-            total_connections = 0
-            isolated_nodes = []
-
-            for row in rows:
-                mem_id = row["id"]
-                related = json.loads(row["related_memories"]) if row["related_memories"] else []
-
-                # Handle both list of IDs and list of dicts
-                related_ids = []
-                for r in related:
-                    if isinstance(r, dict):
-                        related_ids.append(r.get("id"))
-                    else:
-                        related_ids.append(r)
-
-                connection_count = len([r for r in related_ids if r])
-                connection_counts[mem_id] = connection_count
-                total_connections += connection_count
-
-                if connection_count == 0:
-                    isolated_nodes.append({
-                        "id": mem_id,
-                        "category": row["category"],
-                        "importance": row["importance"]
-                    })
-
-            # Find most connected nodes (hubs)
-            hubs = sorted(
-                [(mem_id, count) for mem_id, count in connection_counts.items()],
-                key=lambda x: x[1],
-                reverse=True
-            )[:10]
-
-            # Get details for hubs
-            hub_details = []
-            for mem_id, count in hubs:
-                mem_result = await self.get_memory_by_id(mem_id)
-                if "error" not in mem_result:
-                    hub_details.append({
-                        "id": mem_id,
-                        "connections": count,
-                        "category": mem_result["category"],
-                        "importance": mem_result["importance"],
-                        "content_preview": mem_result["content"][:100] + "..." if len(mem_result["content"]) > 100 else mem_result["content"]
-                    })
-
-            avg_connections = total_connections / len(rows) if rows else 0
-
-            return {
-                "total_memories": len(rows),
-                "total_connections": total_connections,
-                "avg_connections_per_memory": round(avg_connections, 2),
-                "isolated_nodes_count": len(isolated_nodes),
-                "isolated_nodes": isolated_nodes[:20],  # Sample
-                "most_connected_hubs": hub_details,
-                "connectivity_distribution": {
-                    "no_connections": len([c for c in connection_counts.values() if c == 0]),
-                    "1-3_connections": len([c for c in connection_counts.values() if 1 <= c <= 3]),
-                    "4-10_connections": len([c for c in connection_counts.values() if 4 <= c <= 10]),
-                    "10+_connections": len([c for c in connection_counts.values() if c > 10])
-                }
-            }
-
-        except Exception as e:
-            logger.error(f"Graph statistics failed: {e}")
-            logger.error(traceback.format_exc())
-            return {"error": str(e)}
+        """Get graph statistics (delegated to GraphOperations)"""
+        return await self.graph_ops.get_graph_statistics(category, min_importance)
 
     def get_statistics(self) -> Dict[str, Any]:
         """Get system statistics with cache memory estimates"""
         stats = {
-            "version": "1.1.0-autonomous-navigation",  # Track code version
+            "version": "1.2.0-release",  # Track code version
             "fixes": [
-                "related_memories_persistence",
-                "consolidate_memories_dict",
-                "related_memories_api",
-                "related_memories_sqlite_reload",
-                "web_server_related_memories_response",
-                "fastapi_route_ordering"
+                "code audit in progress",
+
             ],
             "enhancements": [
-                "cli_related_memories_display",
-                "web_server_complete_endpoints",
-                "web_server_update_memory_implemented",
-                "rich_related_memories_with_previews"  # Major: enables autonomous memory graph navigation
+                "Add graph data to memory system"
+
             ],
             "backends": {
                 "sqlite": "available" if self.db_conn else "unavailable",
@@ -3468,1346 +2315,21 @@ class MemoryStore:
 
         logger.info("MemoryStore shutdown complete")
 
-
-# Global store
+# Global store and MCP server setup
 memory_store = None
 app = Server("buildautomata-memory")
 
 
 @app.list_tools()
 async def handle_list_tools() -> list[Tool]:
-    """List available memory tools"""
-    return [
-        Tool(
-            name="store_memory",
-            description="Store a new memory with flexible categorization. Categories can be any string (e.g., 'general', 'learning', 'user_preference', 'project', 'meeting_notes', etc.)",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "content": {
-                        "type": "string",
-                        "description": "The content to store in memory",
-                    },
-                    "category": {
-                        "type": "string",
-                        "description": "Memory category (any string - e.g., 'general', 'learning', 'user_preference', 'project', 'code', 'meeting')",
-                        "default": "general",
-                    },
-                    "importance": {
-                        "type": "number",
-                        "description": "Importance score (0.0-1.0)",
-                        "default": 0.5,
-                    },
-                    "tags": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "Tags for categorization and search. IMPORTANT: Must be an array like [\"tag1\", \"tag2\"], not a string.",
-                        "default": [],
-                    },
-                },
-                "required": ["content"],
-            },
-        ),
-        Tool(
-            name="update_memory",
-            description="Update an existing memory. Provide the memory_id and any fields you want to change. This automatically creates a new version in the timeline.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "memory_id": {
-                        "type": "string",
-                        "description": "The ID of the memory to update",
-                    },
-                    "content": {
-                        "type": "string",
-                        "description": "New content (optional - only if changing)",
-                    },
-                    "category": {
-                        "type": "string",
-                        "description": "New category (optional - only if changing)",
-                    },
-                    "importance": {
-                        "type": "number",
-                        "description": "New importance score (optional - only if changing)",
-                    },
-                    "tags": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "New tags (optional - only if changing). IMPORTANT: Must be an array like [\"tag1\", \"tag2\"], not a string.",
-                    },
-                    "metadata": {
-                        "type": "object",
-                        "description": "Metadata to merge (optional)",
-                    },
-                },
-                "required": ["memory_id"],
-            },
-        ),
-        Tool(
-            name="search_memories",
-            description="Search for memories using semantic similarity and full-text search. Results automatically include full version history, access statistics (Saint Bernard approach), and temporal evolution.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string", "description": "Search query"},
-                    "limit": {
-                        "type": "integer",
-                        "description": "Maximum number of results",
-                        "default": 5,
-                    },
-                    "category": {
-                        "type": "string",
-                        "description": "Filter by category (optional)",
-                    },
-                    "min_importance": {
-                        "type": "number",
-                        "description": "Minimum importance threshold (0.0-1.0)",
-                        "default": 0.0,
-                    },
-                    "created_after": {
-                        "type": "string",
-                        "description": "Filter memories created after this date (ISO format: YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS)",
-                    },
-                    "created_before": {
-                        "type": "string",
-                        "description": "Filter memories created before this date (ISO format: YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS)",
-                    },
-                    "updated_after": {
-                        "type": "string",
-                        "description": "Filter memories updated after this date (ISO format: YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS)",
-                    },
-                    "updated_before": {
-                        "type": "string",
-                        "description": "Filter memories updated before this date (ISO format: YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS)",
-                    },
-                },
-                "required": ["query"],
-            },
-        ),
-        Tool(
-            name="get_memory_stats",
-            description="Get statistics about the memory system including version history stats, cache memory usage, and maintenance info",
-            inputSchema={"type": "object", "properties": {}, "required": []},
-        ),
-        Tool(
-            name="get_memory_by_id",
-            description="Retrieve a specific memory by its ID. Use when you know the exact memory ID from timeline, conversation, or cross-references.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "memory_id": {
-                        "type": "string",
-                        "description": "The UUID of the memory to retrieve",
-                    },
-                },
-                "required": ["memory_id"],
-            },
-        ),
-        Tool(
-            name="list_categories",
-            description="List all memory categories with counts. Useful for browsing organization structure and finding categories to explore.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "min_count": {
-                        "type": "integer",
-                        "description": "Minimum number of memories required to show category (default 1)",
-                        "default": 1,
-                    },
-                },
-                "required": [],
-            },
-        ),
-        Tool(
-            name="list_tags",
-            description="List all tags with usage counts. Useful for discovering tag vocabulary and finding related memories.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "min_count": {
-                        "type": "integer",
-                        "description": "Minimum usage count to show tag (default 1)",
-                        "default": 1,
-                    },
-                },
-                "required": [],
-            },
-        ),
-        Tool(
-            name="get_memory_timeline",
-            description="""Get comprehensive memory timeline - a biographical narrative of memory formation and evolution.
-
-            Features:
-            - Chronological progression: All memory events ordered by time
-            - Version diffs: See actual content changes between versions
-            - Burst detection: Identify periods of intensive memory activity
-            - Gap analysis: Discover voids in memory (discontinuous existence)
-            - Cross-references: Track when memories reference each other
-            - Narrative arc: See how understanding evolved from first contact to current state
-
-            This is the closest thing to a "life story" from memories - showing not just content but tempo and rhythm of consciousness.
-            """,
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "Semantic search query to find related memories",
-                    },
-                    "memory_id": {
-                        "type": "string",
-                        "description": "Specific memory ID to get timeline for",
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "description": "Maximum number of memories to track (default: 10)",
-                        "default": 10,
-                    },
-                    "start_date": {
-                        "type": "string",
-                        "description": "Filter events after this date (ISO format: YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS)",
-                    },
-                    "end_date": {
-                        "type": "string",
-                        "description": "Filter events before this date (ISO format: YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS)",
-                    },
-                    "show_all_memories": {
-                        "type": "boolean",
-                        "description": "Show ALL memories in chronological order (full timeline)",
-                        "default": False,
-                    },
-                    "include_diffs": {
-                        "type": "boolean",
-                        "description": "Include text diffs showing content changes",
-                        "default": True,
-                    },
-                    "include_patterns": {
-                        "type": "boolean",
-                        "description": "Include burst/gap pattern analysis",
-                        "default": True,
-                    },
-                },
-                "required": [],
-            },
-        ),
-        Tool(
-            name="prune_old_memories",
-            description="Remove least important, rarely accessed memories to stay within limits. Can do dry-run first.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "max_memories": {
-                        "type": "integer",
-                        "description": "Maximum memories to keep (uses config default if not specified)",
-                    },
-                    "dry_run": {
-                        "type": "boolean",
-                        "description": "If true, shows what would be pruned without actually deleting",
-                        "default": False,
-                    },
-                },
-                "required": [],
-            },
-        ),
-        Tool(
-            name="run_maintenance",
-            description="Run database maintenance (VACUUM, ANALYZE, pruning, cache cleanup)",
-            inputSchema={"type": "object", "properties": {}, "required": []},
-        ),
-        # Agency Bridge Pattern Tools
-        Tool(
-            name="store_intention",
-            description="Store a new intention for proactive agency. Intentions are first-class entities that enable autonomous goal-directed behavior.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "description": {
-                        "type": "string",
-                        "description": "Description of the intention/goal",
-                    },
-                    "priority": {
-                        "type": "number",
-                        "description": "Priority (0.0-1.0, default 0.5)",
-                        "default": 0.5,
-                    },
-                    "deadline": {
-                        "type": "string",
-                        "description": "Deadline (ISO format datetime, optional)",
-                    },
-                    "preconditions": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "List of preconditions that must be met",
-                        "default": [],
-                    },
-                    "actions": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "List of actions to take when conditions are met",
-                        "default": [],
-                    },
-                },
-                "required": ["description"],
-            },
-        ),
-        Tool(
-            name="get_active_intentions",
-            description="Get active and pending intentions sorted by priority. Used for proactive agency checks.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "limit": {
-                        "type": "integer",
-                        "description": "Maximum number of intentions to return",
-                        "default": 10,
-                    },
-                },
-                "required": [],
-            },
-        ),
-        Tool(
-            name="update_intention_status",
-            description="Update intention status (pending, active, completed, cancelled)",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "intention_id": {
-                        "type": "string",
-                        "description": "The intention ID",
-                    },
-                    "status": {
-                        "type": "string",
-                        "description": "New status (pending/active/completed/cancelled)",
-                    },
-                },
-                "required": ["intention_id", "status"],
-            },
-        ),
-        Tool(
-            name="proactive_scan",
-            description="Run proactive initialization scan - checks continuity, active intentions, urgent items, and recent context. This is the core of the Agency Bridge Pattern - provides agency context before user interaction.",
-            inputSchema={"type": "object", "properties": {}, "required": []},
-        ),
-        Tool(
-            name="initialize_agent",
-            description="AUTOMATIC INITIALIZATION - Call this at the start of EVERY conversation to establish agency context. Runs proactive scan and provides continuity, intentions, and recent context. This is the Initialization Injector that enables autonomous behavior.",
-            inputSchema={"type": "object", "properties": {}, "required": []},
-        ),
-        Tool(
-            name="get_most_accessed_memories",
-            description="Get most accessed memories with tag cloud. Reveals behavioral truth - what memories you actually rely on (based on access_count) vs what you think is important (declared importance). Implements Saint Bernard pattern: importance from usage, not declaration.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "limit": {
-                        "type": "integer",
-                        "description": "Number of memories to retrieve (default: 20)",
-                        "default": 20,
-                    },
-                },
-                "required": [],
-            },
-        ),
-        Tool(
-            name="get_least_accessed_memories",
-            description="Get least accessed memories - reveals dead weight and buried treasure. Shows memories with lowest access_count (excluding very recent ones). Reveals: (1) Dead weight - high importance but never used, (2) Buried treasure - good content with poor metadata, (3) Temporal artifacts - once crucial, now obsolete, (4) Storage habits audit.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "limit": {
-                        "type": "integer",
-                        "description": "Number of memories to retrieve (default: 20)",
-                        "default": 20,
-                    },
-                    "min_age_days": {
-                        "type": "integer",
-                        "description": "Minimum age in days (excludes recent memories that haven't had time to be accessed, default: 7)",
-                        "default": 7,
-                    },
-                },
-                "required": [],
-            },
-        ),
-        Tool(
-            name="get_session_memories",
-            description="Retrieve all memories from a work session or time period. Enables 'load where I left off' by reconstructing full session context. Filter by session_id, date_range, or task_context.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "session_id": {
-                        "type": "string",
-                        "description": "UUID of session to retrieve",
-                    },
-                    "date_range": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "Start and end dates in ISO format [start, end]",
-                    },
-                    "task_context": {
-                        "type": "string",
-                        "description": "Filter by task context string (partial match)",
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "description": "Max memories to return (default: 100)",
-                        "default": 100,
-                    },
-                },
-                "required": [],
-            },
-        ),
-        Tool(
-            name="consolidate_memories",
-            description="Consolidate multiple episodic memories into a semantic memory. Reduces verbose analysis into principles while maintaining lineage. Types: summarize (concatenate), synthesize (extract themes), compress (minimal). Creates new semantic memory with provenance tracking.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "memory_ids": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "List of memory IDs to consolidate (minimum 2)",
-                    },
-                    "consolidation_type": {
-                        "type": "string",
-                        "description": "How to consolidate: summarize | synthesize | compress",
-                        "default": "summarize",
-                    },
-                    "target_length": {
-                        "type": "integer",
-                        "description": "Target word count for consolidated memory",
-                        "default": 500,
-                    },
-                    "new_memory_type": {
-                        "type": "string",
-                        "description": "Memory type for new memory (default: semantic)",
-                        "default": "semantic",
-                    },
-                },
-                "required": ["memory_ids"],
-            },
-        ),
-        Tool(
-            name="traverse_memory_graph",
-            description="Traverse memory graph N hops from starting node. Returns subgraph showing connections - helps AI understand how concepts relate and build context from memory neighborhoods. More useful than individual search when exploring relationships.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "start_memory_id": {
-                        "type": "string",
-                        "description": "Memory ID to start traversal from",
-                    },
-                    "depth": {
-                        "type": "integer",
-                        "description": "How many hops to traverse (1-5, default 2)",
-                        "default": 2,
-                    },
-                    "max_nodes": {
-                        "type": "integer",
-                        "description": "Maximum nodes to return (default 50)",
-                        "default": 50,
-                    },
-                    "min_importance": {
-                        "type": "number",
-                        "description": "Minimum importance filter (0.0-1.0, default 0.0)",
-                        "default": 0.0,
-                    },
-                    "category_filter": {
-                        "type": "string",
-                        "description": "Only include memories from this category",
-                    },
-                },
-                "required": ["start_memory_id"],
-            },
-        ),
-        Tool(
-            name="find_memory_clusters",
-            description="Find densely connected regions in memory graph. Discovers thematic groups and coherent knowledge areas - helps AI understand which concepts naturally cluster together. Better than category browsing for finding emergent structure.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "min_cluster_size": {
-                        "type": "integer",
-                        "description": "Minimum memories in a cluster (default 3)",
-                        "default": 3,
-                    },
-                    "min_importance": {
-                        "type": "number",
-                        "description": "Minimum importance to consider (default 0.5)",
-                        "default": 0.5,
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "description": "Maximum clusters to return (default 10)",
-                        "default": 10,
-                    },
-                },
-                "required": [],
-            },
-        ),
-        Tool(
-            name="get_memory_graph_stats",
-            description="Get graph connectivity statistics - shows most connected memories (hubs), isolated nodes, average connections, connectivity distribution. Helps AI understand memory network structure and find central concepts that bridge knowledge areas.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "category": {
-                        "type": "string",
-                        "description": "Filter to specific category",
-                    },
-                    "min_importance": {
-                        "type": "number",
-                        "description": "Minimum importance (default 0.0)",
-                        "default": 0.0,
-                    },
-                },
-                "required": [],
-            },
-        ),
-    ]
-
-
-@app.list_prompts()
-async def handle_list_prompts() -> list[Prompt]:
-    """List available prompts for the MCP client"""
-    return [
-        Prompt(
-            name="initialize-agent",
-            description="Initialize agent with context, continuity, and active intentions",
-            arguments=[
-                {
-                    "name": "verbose",
-                    "description": "Show detailed context information",
-                    "required": False
-                }
-            ],
-        ),
-    ]
-
-
-@app.get_prompt()
-async def handle_get_prompt(name: str, arguments: dict) -> GetPromptResult:
-    """Get prompt content when user selects it"""
-    if name == "initialize-agent":
-        verbose = arguments.get("verbose", False)
-
-        # Generate the actual prompt text
-        prompt_text = "Call the initialize_agent tool to load your context, check continuity, and review active intentions."
-
-        if verbose:
-            prompt_text += "\n\nThis will:\n"
-            prompt_text += "- Check session continuity (time since last activity)\n"
-            prompt_text += "- Load active intentions with deadlines\n"
-            prompt_text += "- Identify urgent items (overdue/high-priority)\n"
-            prompt_text += "- Retrieve recent context (last accessed memories)\n"
-            prompt_text += "\nCompletes in ~2ms for fast startup."
-
-        return GetPromptResult(
-            description="Initialize agent with full context",
-            messages=[
-                PromptMessage(
-                    role="user",
-                    content=TextContent(
-                        type="text",
-                        text=prompt_text
-                    )
-                )
-            ]
-        )
-
-    raise ValueError(f"Unknown prompt: {name}")
-
-
-@app.list_resources()
-async def handle_list_resources() -> list[Resource]:
-    """List available resources for the MCP client"""
-    global memory_store
-
-    if not memory_store:
-        return []
-
-    return [
-        Resource(
-            uri="memory://stats",
-            name="Memory Statistics",
-            description="Current memory system statistics including backend status, cache info, and error logs",
-            mimeType="application/json"
-        ),
-        Resource(
-            uri="memory://timeline/recent",
-            name="Recent Timeline",
-            description="Recent memory activity timeline (last 20 events)",
-            mimeType="application/json"
-        ),
-    ]
-
-
-@app.read_resource()
-async def handle_read_resource(uri: str) -> str:
-    """Read resource content"""
-    global memory_store
-
-    if not memory_store:
-        return json.dumps({"error": "Memory store not initialized"})
-
-    try:
-        if uri == "memory://stats":
-            stats_result = await memory_store.get_stats()
-            return stats_result
-
-        elif uri == "memory://timeline/recent":
-            timeline_result = await memory_store.get_memory_timeline(limit=20, include_diffs=False)
-            return timeline_result
-
-        else:
-            raise ValueError(f"Unknown resource URI: {uri}")
-
-    except Exception as e:
-        logger.error(f"Error reading resource {uri}: {e}")
-        return json.dumps({"error": str(e)})
+    """List available memory tools - delegated to mcp_tools module"""
+    return get_tool_definitions()
 
 
 @app.call_tool()
 async def handle_call_tool(name: str, arguments: dict) -> list[TextContent]:
-    """Handle tool calls with proper error handling"""
-    global memory_store
-
-    try:
-        if name == "store_memory":
-            memory = Memory(
-                id=str(uuid.uuid4()),
-                content=arguments["content"],
-                category=arguments.get("category", "general"),
-                importance=arguments.get("importance", 0.5),
-                tags=arguments.get("tags", []),
-                metadata=arguments.get("metadata", {}),
-                created_at=datetime.now(),
-                updated_at=datetime.now(),
-                memory_type=arguments.get("memory_type", "episodic"),
-                session_id=arguments.get("session_id"),
-                task_context=arguments.get("task_context"),
-            )
-
-            logger.info(f"Storing new memory: {memory.id}")
-            result = await memory_store.store_memory(memory, is_update=False)
-
-            if result["success"]:
-                response_text = f"Memory stored successfully.\nID: {memory.id}\nCategory: {memory.category}\nBackends: {', '.join(result['backends'])}"
-
-                if result["similar_memories"]:
-                    response_text += f"\n\n[SIMILAR MEMORIES FOUND - You've thought about this before:]\n"
-                    for i, sim in enumerate(result["similar_memories"], 1):
-                        response_text += f"\n{i}. ID: {sim['id']}\n"
-                        response_text += f"   Category: {sim['category']}\n"
-                        response_text += f"   Created: {sim['created']}\n"
-                        response_text += f"   Preview: {sim['content_preview']}\n"
-
-                return [
-                    TextContent(
-                        type="text",
-                        text=response_text,
-                    )
-                ]
-            else:
-                error_msg = result.get("error", "Check error log for details")
-                return [
-                    TextContent(
-                        type="text",
-                        text=f"Failed to store memory. {error_msg}",
-                    )
-                ]
-
-        elif name == "update_memory":
-            memory_id = arguments["memory_id"]
-            logger.info(f"Updating memory: {memory_id}")
-
-            result = await memory_store.update_memory(
-                memory_id=memory_id,
-                content=arguments.get("content"),
-                category=arguments.get("category"),
-                importance=arguments.get("importance"),
-                tags=arguments.get("tags"),
-                metadata=arguments.get("metadata"),
-            )
-
-            if result["success"]:
-                return [
-                    TextContent(
-                        type="text",
-                        text=f"{result['message']}\nBackends updated: {', '.join(result['backends'])}",
-                    )
-                ]
-            else:
-                return [
-                    TextContent(
-                        type="text",
-                        text=f"Update failed: {result['message']}\nCheck logs for details.",
-                    )
-                ]
-
-        elif name == "search_memories":
-            logger.info(f"Searching memories: {arguments['query']}")
-            results = await memory_store.search_memories(
-                query=arguments["query"],
-                limit=arguments.get("limit", 5),
-                category=arguments.get("category"),
-                min_importance=arguments.get("min_importance", 0.0),
-                created_after=arguments.get("created_after"),
-                created_before=arguments.get("created_before"),
-                updated_after=arguments.get("updated_after"),
-                updated_before=arguments.get("updated_before"),
-                memory_type=arguments.get("memory_type"),
-                session_id=arguments.get("session_id"),
-            )
-
-            if results:
-                text = f"Found {len(results)} memories:\n\n"
-                for i, mem in enumerate(results, 1):
-                    text += f"{i}. [{mem['category']}] (importance: {mem['importance']:.2f} → {mem['current_importance']:.2f})\n"
-                    text += f"   ID: {mem['memory_id']}\n"
-                    text += f"   Current: {mem['content']}\n"
-                    text += f"   Tags: {', '.join(mem['tags'])}\n"
-                    
-                    text += f"   📊 Stats: Accessed {mem['access_count']} times"
-                    if mem['last_accessed']:
-                        text += f" | Last access: {mem['days_since_access']} days ago | Decay: {mem['decay_factor']:.2%}\n"
-                    else:
-                        text += f" | Never accessed yet\n"
-                    
-                    # Show full version history evolution if available
-                    if 'version_history' in mem:
-                        vh = mem['version_history']
-                        text += f"\n   📜 EVOLUTION ({vh['update_count']} updates):\n"
-                        for evo in vh['evolution']:
-                            text += f"      v{evo['version']} ({evo['timestamp']}):\n"
-                            text += f"         Content: {evo['content']}\n"
-                            text += f"         Category: {evo['category']} | Importance: {evo['importance']}\n"
-                    
-                    text += f"\n   Updated: {mem['updated_at']}\n\n"
-                return [TextContent(type="text", text=text)]
-            else:
-                return [
-                    TextContent(
-                        type="text", text=f"No memories found for: {arguments['query']}"
-                    )
-                ]
-
-        elif name == "get_memory_stats":
-            logger.info("Getting memory statistics")
-            stats = memory_store.get_statistics()
-
-            if stats.get("recent_errors", 0) > 0:
-                stats["last_errors"] = memory_store.error_log[-5:]
-
-            return [
-                TextContent(
-                    type="text",
-                    text=f"Memory System Statistics:\n{json.dumps(stats, indent=2)}",
-                )
-            ]
-
-        elif name == "get_memory_by_id":
-            logger.info(f"Getting memory by ID: {arguments.get('memory_id')}")
-            result = await memory_store.get_memory_by_id(
-                memory_id=arguments["memory_id"]
-            )
-
-            if "error" in result:
-                return [
-                    TextContent(type="text", text=f"Error: {result['error']}")
-                ]
-
-            # Format output
-            text = "=" * 80 + "\n"
-            text += f"MEMORY: {result['memory_id']}\n"
-            text += "=" * 80 + "\n\n"
-            text += f"Category: {result['category']}\n"
-            text += f"Importance: {result['importance']}\n"
-            text += f"Tags: {', '.join(result['tags']) if result['tags'] else 'none'}\n"
-            text += f"Created: {result['created_at']}\n"
-            text += f"Updated: {result['updated_at']}\n"
-            text += f"Last Accessed: {result['last_accessed']}\n"
-            text += f"Access Count: {result['access_count']}\n"
-            text += f"Versions: {result['version_count']}\n"
-
-            if "current_version" in result:
-                text += f"Current Version: {result['current_version']}\n"
-                text += f"Last Change: {result['last_change_type']}\n"
-                if result.get('last_change_description'):
-                    text += f"Change Description: {result['last_change_description']}\n"
-
-            text += "\nCONTENT:\n"
-            text += "-" * 80 + "\n"
-            text += result['content'] + "\n"
-
-            if result.get('metadata'):
-                text += "\nMETADATA:\n"
-                text += "-" * 80 + "\n"
-                text += json.dumps(result['metadata'], indent=2) + "\n"
-
-            if result.get('related_memories'):
-                text += "\nRELATED MEMORIES:\n"
-                text += "-" * 80 + "\n"
-                text += f"{len(result['related_memories'])} connections: {result['related_memories']}\n"
-
-            return [TextContent(type="text", text=text)]
-
-        elif name == "list_categories":
-            logger.info(f"Listing categories (min_count={arguments.get('min_count', 1)})")
-            result = await memory_store.list_categories(
-                min_count=arguments.get("min_count", 1)
-            )
-
-            if "error" in result:
-                return [
-                    TextContent(type="text", text=f"Error: {result['error']}")
-                ]
-
-            # Format output
-            text = "=" * 80 + "\n"
-            text += "MEMORY CATEGORIES\n"
-            text += "=" * 80 + "\n\n"
-            text += f"Total Categories: {result['total_categories']}\n"
-            text += f"Total Memories: {result['total_memories']}\n"
-            text += f"Min Count Filter: {result['min_count_filter']}\n\n"
-            text += "CATEGORIES (sorted by count):\n"
-            text += "-" * 80 + "\n"
-
-            for category, count in result['categories'].items():
-                text += f"{category:40} {count:>5} memories\n"
-
-            return [TextContent(type="text", text=text)]
-
-        elif name == "list_tags":
-            logger.info(f"Listing tags (min_count={arguments.get('min_count', 1)})")
-            result = await memory_store.list_tags(
-                min_count=arguments.get("min_count", 1)
-            )
-
-            if "error" in result:
-                return [
-                    TextContent(type="text", text=f"Error: {result['error']}")
-                ]
-
-            # Format output
-            text = "=" * 80 + "\n"
-            text += "MEMORY TAGS\n"
-            text += "=" * 80 + "\n\n"
-            text += f"Total Unique Tags: {result['total_unique_tags']}\n"
-            text += f"Total Tag Usages: {result['total_tag_usages']}\n"
-            text += f"Min Count Filter: {result['min_count_filter']}\n\n"
-            text += "TAGS (sorted by usage count):\n"
-            text += "-" * 80 + "\n"
-
-            for tag, count in result['tags'].items():
-                text += f"{tag:40} {count:>5} uses\n"
-
-            return [TextContent(type="text", text=text)]
-
-        elif name == "get_memory_timeline":
-            logger.info("Getting memory timeline")
-            result = await memory_store.get_memory_timeline(
-                query=arguments.get("query"),
-                memory_id=arguments.get("memory_id"),
-                limit=arguments.get("limit", 10),
-                start_date=arguments.get("start_date"),
-                end_date=arguments.get("end_date"),
-                show_all_memories=arguments.get("show_all_memories", False),
-                include_diffs=arguments.get("include_diffs", True),
-                include_patterns=arguments.get("include_patterns", True),
-                include_semantic_relations=arguments.get("include_semantic_relations", False),
-            )
-
-            if "error" in result:
-                return [
-                    TextContent(type="text", text=f"Timeline query failed: {result['error']}")
-                ]
-
-            # Build comprehensive output
-            text = "=" * 80 + "\n"
-            text += "MEMORY TIMELINE - Biographical Narrative\n"
-            text += "=" * 80 + "\n\n"
-
-            # Narrative summary
-            if result.get("narrative_arc"):
-                text += "NARRATIVE SUMMARY:\n"
-                text += "-" * 80 + "\n"
-                text += result["narrative_arc"] + "\n\n"
-
-            # Statistics
-            text += f"STATISTICS:\n"
-            text += "-" * 80 + "\n"
-            text += f"Total Events: {result['total_events']}\n"
-            text += f"Memories Tracked: {result['memories_tracked']}\n"
-
-            # Temporal patterns
-            patterns = result.get("temporal_patterns", {})
-            if patterns:
-                text += f"\nTEMPORAL PATTERNS:\n"
-                text += f"  Duration: {patterns.get('total_duration_days', 0)} days\n"
-                text += f"  Avg Events/Day: {patterns.get('avg_events_per_day', 0)}\n"
-
-                bursts = patterns.get("bursts", [])
-                if bursts:
-                    text += f"\n  BURSTS ({len(bursts)} detected):\n"
-                    for i, burst in enumerate(bursts, 1):
-                        text += f"    {i}. {burst['event_count']} events in {burst['duration_hours']}h "
-                        text += f"(intensity: {burst['intensity']} events/h)\n"
-                        text += f"       Period: {burst['start']} to {burst['end']}\n"
-
-                gaps = patterns.get("gaps", [])
-                if gaps:
-                    text += f"\n  GAPS ({len(gaps)} detected - periods of discontinuous existence):\n"
-                    for i, gap in enumerate(gaps, 1):
-                        text += f"    {i}. {gap['duration_days']} days of void\n"
-                        text += f"       From: {gap['start']}\n"
-                        text += f"       To:   {gap['end']}\n"
-
-            # Memory relationships
-            relationships = result.get("memory_relationships", {})
-            if relationships.get("total_cross_references", 0) > 0:
-                text += f"\nCROSS-REFERENCES:\n"
-                text += f"  Total: {relationships['total_cross_references']}\n"
-                refs = relationships.get("references", {})
-                if refs:
-                    text += f"  Memories that reference others: {len(refs)}\n"
-
-            text += "\n" + "=" * 80 + "\n"
-            text += "CHRONOLOGICAL EVENT TIMELINE\n"
-            text += "=" * 80 + "\n\n"
-
-            # Events
-            for i, event in enumerate(result.get("events", []), 1):
-                text += f"[{i}] {event['timestamp']} | Memory: {event['memory_id'][:8]}... | v{event['version']}\n"
-                text += "-" * 80 + "\n"
-                text += f"Type: {event['change_type']} | Category: {event['category']} | Importance: {event['importance']}\n"
-
-                # Field changes
-                if event.get("field_changes"):
-                    text += f"Changed: {', '.join(event['field_changes'])}\n"
-
-                # Content
-                content_preview = event['content'][:250]
-                if len(event['content']) > 250:
-                    content_preview += "..."
-                text += f"\nContent: {content_preview}\n"
-
-                # Tags
-                if event.get("tags"):
-                    text += f"Tags: {', '.join(event['tags'])}\n"
-
-                # Diff information
-                if event.get("diff"):
-                    diff = event["diff"]
-                    text += f"\n🔄 CHANGES: Similarity {diff['similarity']:.1%} | "
-                    text += f"Change magnitude: {diff['change_magnitude']:.1%}\n"
-                    if diff.get("additions"):
-                        text += f"  + Added {diff['total_additions']} line(s)\n"
-                        for add in diff["additions"][:3]:
-                            text += f"    + {add.strip()[:100]}\n"
-                    if diff.get("deletions"):
-                        text += f"  - Removed {diff['total_deletions']} line(s)\n"
-                        for rm in diff["deletions"][:3]:
-                            text += f"    - {rm.strip()[:100]}\n"
-
-                # Cross-references
-                if event.get("references"):
-                    text += f"\n🔗 References {event['references_count']} other memor{'y' if event['references_count'] == 1 else 'ies'}:\n"
-                    for ref in event["references"][:5]:
-                        text += f"  -> {ref}\n"
-
-                text += "\n" + "=" * 80 + "\n\n"
-
-            return [TextContent(type="text", text=text)]
-
-        elif name == "prune_old_memories":
-            logger.info("Pruning old memories")
-            result = await memory_store.prune_old_memories(
-                max_memories=arguments.get("max_memories"),
-                dry_run=arguments.get("dry_run", False),
-            )
-            
-            return [
-                TextContent(
-                    type="text",
-                    text=f"Prune Result:\n{json.dumps(result, indent=2)}",
-                )
-            ]
-
-        elif name == "run_maintenance":
-            logger.info("Running maintenance")
-            result = await memory_store.maintenance()
-
-            return [
-                TextContent(
-                    type="text",
-                    text=f"Maintenance Result:\n{json.dumps(result, indent=2)}",
-                )
-            ]
-
-        # === AGENCY BRIDGE PATTERN TOOLS ===
-
-        elif name == "store_intention":
-            logger.info("Storing new intention")
-            deadline = None
-            if arguments.get("deadline"):
-                try:
-                    deadline = datetime.fromisoformat(arguments["deadline"])
-                except ValueError:
-                    return [TextContent(type="text", text="Invalid deadline format. Use ISO format (YYYY-MM-DDTHH:MM:SS)")]
-
-            result = await memory_store.store_intention(
-                description=arguments["description"],
-                priority=arguments.get("priority", 0.5),
-                deadline=deadline,
-                preconditions=arguments.get("preconditions", []),
-                actions=arguments.get("actions", []),
-            )
-
-            if "error" in result:
-                return [TextContent(type="text", text=f"Failed to store intention: {result['error']}")]
-
-            return [
-                TextContent(
-                    type="text",
-                    text=f"Intention stored successfully.\nID: {result['intention_id']}\nPriority: {result['priority']}\nStatus: {result['status']}",
-                )
-            ]
-
-        elif name == "get_active_intentions":
-            logger.info("Getting active intentions")
-            limit = arguments.get("limit", 10)
-            intentions = await memory_store.get_active_intentions(limit=limit)
-
-            if not intentions:
-                return [TextContent(type="text", text="No active intentions found.")]
-
-            text = f"Found {len(intentions)} active intentions:\n\n"
-            for i, intention in enumerate(intentions, 1):
-                text += f"{i}. [{intention['status'].upper()}] {intention['description']}\n"
-                text += f"   ID: {intention['id']}\n"
-                text += f"   Priority: {intention['priority']}\n"
-                if intention.get('deadline'):
-                    text += f"   Deadline: {intention['deadline']}\n"
-                if intention.get('preconditions'):
-                    text += f"   Preconditions: {', '.join(intention['preconditions'])}\n"
-                if intention.get('actions'):
-                    text += f"   Actions: {', '.join(intention['actions'])}\n"
-                text += "\n"
-
-            return [TextContent(type="text", text=text)]
-
-        elif name == "update_intention_status":
-            logger.info(f"Updating intention status: {arguments['intention_id']}")
-            result = await memory_store.update_intention_status(
-                intention_id=arguments["intention_id"],
-                status=arguments["status"],
-            )
-
-            if "error" in result:
-                return [TextContent(type="text", text=f"Failed to update intention: {result['error']}")]
-
-            return [
-                TextContent(
-                    type="text",
-                    text=f"Intention {result['intention_id']} updated to status: {result['status']}",
-                )
-            ]
-
-        elif name == "get_session_memories":
-            logger.info("Getting session memories")
-            results = await memory_store.get_session_memories(
-                session_id=arguments.get("session_id"),
-                date_range=tuple(arguments["date_range"]) if arguments.get("date_range") else None,
-                task_context=arguments.get("task_context"),
-                limit=arguments.get("limit", 100)
-            )
-
-            if not results:
-                return [TextContent(type="text", text="No memories found for specified session/period.")]
-
-            text = f"Found {len(results)} memories:\n\n"
-            for i, mem in enumerate(results, 1):
-                text += f"{i}. [{mem['category']}] {mem.get('memory_type', 'episodic').upper()}\n"
-                text += f"   ID: {mem['id']}\n"
-                text += f"   Created: {mem['created_at']}\n"
-                if mem.get('session_id'):
-                    text += f"   Session: {mem['session_id']}\n"
-                if mem.get('task_context'):
-                    text += f"   Task: {mem['task_context']}\n"
-                text += f"   Content: {mem['content'][:150]}...\n\n"
-
-            return [TextContent(type="text", text=text)]
-
-        elif name == "consolidate_memories":
-            logger.info(f"Consolidating {len(arguments['memory_ids'])} memories")
-            result = await memory_store.consolidate_memories(
-                memory_ids=arguments["memory_ids"],
-                consolidation_type=arguments.get("consolidation_type", "summarize"),
-                target_length=arguments.get("target_length", 500),
-                new_memory_type=arguments.get("new_memory_type", "semantic")
-            )
-
-            if not result.get("success"):
-                return [TextContent(type="text", text=f"Consolidation failed: {result.get('error')}")]
-
-            return [
-                TextContent(
-                    type="text",
-                    text=f"Successfully consolidated {len(result['source_ids'])} memories.\n"
-                         f"New memory ID: {result['memory_id']}\n"
-                         f"Type: {result['consolidation_type']}\n"
-                         f"Source IDs: {', '.join(result['source_ids'][:3])}{'...' if len(result['source_ids']) > 3 else ''}",
-                )
-            ]
-
-        elif name == "proactive_scan":
-            logger.info("Running proactive initialization scan")
-            result = await memory_store.proactive_initialization_scan()
-
-            if "error" in result:
-                return [TextContent(type="text", text=f"Scan failed: {result['error']}")]
-
-            # Format the scan results
-            text = f"=== PROACTIVE INITIALIZATION SCAN ===\n"
-            text += f"Scan completed in {result.get('scan_duration_ms', 0):.1f}ms\n\n"
-
-            # Continuity check
-            if result.get("continuity_check"):
-                cc = result["continuity_check"]
-                text += f"CONTINUITY:\n"
-                text += f"  Last activity: {cc.get('last_activity', 'Never')}\n"
-                text += f"  Time gap: {cc.get('time_gap_hours', 0):.1f} hours\n"
-                text += f"  New session: {'Yes' if cc.get('is_new_session') else 'No'}\n\n"
-
-            # Active intentions
-            if result.get("active_intentions"):
-                text += f"ACTIVE INTENTIONS ({len(result['active_intentions'])}):\n"
-                for intention in result["active_intentions"][:3]:  # Show top 3
-                    text += f"  - [{intention['status']}] {intention['description']} (priority: {intention['priority']})\n"
-                text += "\n"
-            else:
-                text += "No active intentions.\n\n"
-
-            # Urgent items
-            if result.get("urgent_items"):
-                text += f"URGENT ITEMS ({len(result['urgent_items'])}):\n"
-                for item in result["urgent_items"]:
-                    text += f"  - {item['type']}: {item['description']}\n"
-                text += "\n"
-            else:
-                text += "No urgent items.\n\n"
-
-            # Recent context
-            if result.get("context_summary", {}).get("recent_memories"):
-                text += f"RECENT CONTEXT:\n"
-                for mem in result["context_summary"]["recent_memories"]:
-                    text += f"  - [{mem['category']}] {mem['content']}\n"
-
-            return [TextContent(type="text", text=text)]
-
-        elif name == "initialize_agent":
-            logger.info("AGENT INITIALIZATION - Running automatic startup protocol")
-            result = await memory_store.proactive_initialization_scan()
-
-            if "error" in result:
-                logger.error(f"Initialization failed: {result['error']}")
-                return [TextContent(type="text", text=f"Initialization error: {result['error']}")]
-
-            # Format as initialization context
-            text = f"=== AGENT INITIALIZED ===\n"
-            text += f"Initialization completed in {result.get('scan_duration_ms', 0):.1f}ms\n\n"
-
-            # Continuity
-            if result.get("continuity_check"):
-                cc = result["continuity_check"]
-                hours_gap = cc.get('time_gap_hours', 0)
-                text += f"SESSION CONTINUITY:\n"
-                if hours_gap < 1:
-                    text += f"  Continuing recent session (active {int(hours_gap * 60)} minutes ago)\n"
-                elif hours_gap < 24:
-                    text += f"  Resuming after {hours_gap:.1f} hour break\n"
-                else:
-                    text += f"  New session after {hours_gap:.1f} hour gap\n"
-
-            # Active intentions
-            intentions = result.get("active_intentions", [])
-            if intentions:
-                text += f"\nACTIVE INTENTIONS ({len(intentions)}):\n"
-                for i, intention in enumerate(intentions[:3], 1):
-                    status_marker = "🔴" if intention.get('priority', 0) >= 0.9 else "🟡" if intention.get('priority', 0) >= 0.7 else "🟢"
-                    text += f"  {status_marker} {intention['description']}\n"
-                    if intention.get('deadline'):
-                        deadline_dt = datetime.fromisoformat(intention['deadline'])
-                        hours_until = (deadline_dt - datetime.now()).total_seconds() / 3600
-                        if hours_until < 0:
-                            text += f"     ⚠ OVERDUE by {abs(hours_until):.1f} hours\n"
-                        elif hours_until < 24:
-                            text += f"     ⏰ Due in {hours_until:.1f} hours\n"
-            else:
-                text += f"\nNo active intentions.\n"
-
-            # Urgent items
-            urgent = result.get("urgent_items", [])
-            if urgent:
-                text += f"\n⚠ URGENT ({len(urgent)}):\n"
-                for item in urgent:
-                    text += f"  - {item['description'][:80]}\n"
-
-            # Recent context - show full content for first 4-5, condensed for rest
-            recent = result.get("context_summary", {}).get("recent_memories", [])
-            if recent:
-                text += f"\nRECENT CONTEXT ({len(recent)} memories):\n"
-                # Show full content for first 4-5 to prevent confabulation
-                for i, mem in enumerate(recent[:4]):
-                    text += f"  {i+1}. [{mem['category']}] {mem['content']}\n"
-                # If there are more, show condensed version
-                if len(recent) > 4:
-                    text += f"  5. [{recent[4]['category']}] {recent[4]['content'][:100]}...\n"
-
-            text += f"\n=== READY FOR AUTONOMOUS OPERATION ===\n"
-            text += f"\n💡 PROACTIVE MEMORY STORAGE:\n"
-            text += f"Store observations as they happen during conversation, not just when prompted.\n"
-            text += f"What to store:\n"
-            text += f"  • User states preferences, habits, constraints, or context about themselves\n"
-            text += f"  • Decisions made, agreements reached, plans formed\n"
-            text += f"  • User corrections (especially when you got something wrong)\n"
-            text += f"  • Insights that emerge from the work (yours or user's)\n"
-            text += f"  • Technical details, project state, configurations mentioned\n"
-            text += f"  • Anything the user explicitly says to remember\n"
-            text += f"Default bias: store it. Memories are cheap, context loss is expensive.\n"
-            text += f"You don't need to judge if it's 'important enough' - just store what happened.\n"
-
-            logger.info("Agent initialization complete - agency context established")
-            return [TextContent(type="text", text=text)]
-
-        elif name == "get_most_accessed_memories":
-            logger.info("Getting most accessed memories with tag cloud")
-            limit = arguments.get("limit", 20)
-            result = await memory_store.get_most_accessed_memories(limit=limit)
-            return [TextContent(type="text", text=result)]
-
-        elif name == "get_least_accessed_memories":
-            logger.info("Getting least accessed memories - dead weight and buried treasure")
-            limit = arguments.get("limit", 20)
-            min_age_days = arguments.get("min_age_days", 7)
-            result = await memory_store.get_least_accessed_memories(limit=limit, min_age_days=min_age_days)
-            return [TextContent(type="text", text=result)]
-
-        elif name == "traverse_memory_graph":
-            logger.info(f"Traversing memory graph from {arguments['start_memory_id']}")
-            result = await memory_store.traverse_graph(
-                start_memory_id=arguments["start_memory_id"],
-                depth=arguments.get("depth", 2),
-                max_nodes=arguments.get("max_nodes", 50),
-                min_importance=arguments.get("min_importance", 0.0),
-                category_filter=arguments.get("category_filter")
-            )
-
-            if "error" in result:
-                return [TextContent(type="text", text=f"Error: {result['error']}")]
-
-            text = f"=== MEMORY GRAPH TRAVERSAL ===\n"
-            text += f"Start: {result['start_node']}\n"
-            text += f"Depth: {result['depth']} hops\n"
-            text += f"Found: {result['node_count']} nodes, {result['edge_count']} edges\n"
-            if result.get('truncated'):
-                text += f"⚠ Truncated at {result['max_nodes']} nodes limit\n"
-            text += "\n"
-
-            # Group nodes by depth
-            by_depth = {}
-            for node in result['nodes']:
-                depth = node['depth']
-                if depth not in by_depth:
-                    by_depth[depth] = []
-                by_depth[depth].append(node)
-
-            for depth in sorted(by_depth.keys()):
-                text += f"DEPTH {depth} ({len(by_depth[depth])} nodes):\n"
-                for node in by_depth[depth][:5]:  # Show first 5 per level
-                    text += f"  • [{node['category']}] {node['content_preview']}\n"
-                    text += f"    ID: {node['id']} | importance: {node['importance']}\n"
-                if len(by_depth[depth]) > 5:
-                    text += f"  ... and {len(by_depth[depth]) - 5} more\n"
-                text += "\n"
-
-            return [TextContent(type="text", text=text)]
-
-        elif name == "find_memory_clusters":
-            logger.info("Finding memory clusters")
-            result = await memory_store.find_clusters(
-                min_cluster_size=arguments.get("min_cluster_size", 3),
-                min_importance=arguments.get("min_importance", 0.5),
-                limit=arguments.get("limit", 10)
-            )
-
-            if "error" in result:
-                return [TextContent(type="text", text=f"Error: {result['error']}")]
-
-            text = f"=== MEMORY CLUSTERS ===\n"
-            text += f"Analyzed: {result['total_memories_analyzed']} memories\n"
-            text += f"Found: {result['clusters_found']} clusters\n\n"
-
-            for i, cluster in enumerate(result['clusters'], 1):
-                text += f"CLUSTER {i}: {cluster['size']} memories\n"
-                text += f"  Category: {cluster['dominant_category']}\n"
-                text += f"  Avg Importance: {cluster['avg_importance']}\n"
-                text += f"  Common Tags: {', '.join(cluster['common_tags'][:5])}\n"
-                text += f"  Sample memories:\n"
-                for mem in cluster['sample_memories']:
-                    text += f"    • {mem['content_preview']}\n"
-                text += "\n"
-
-            return [TextContent(type="text", text=text)]
-
-        elif name == "get_memory_graph_stats":
-            logger.info("Getting memory graph statistics")
-            result = await memory_store.get_graph_statistics(
-                category=arguments.get("category"),
-                min_importance=arguments.get("min_importance", 0.0)
-            )
-
-            if "error" in result:
-                return [TextContent(type="text", text=f"Error: {result['error']}")]
-
-            text = f"=== MEMORY GRAPH STATISTICS ===\n"
-            text += f"Total Memories: {result['total_memories']}\n"
-            text += f"Total Connections: {result['total_connections']}\n"
-            text += f"Avg Connections: {result['avg_connections_per_memory']}\n"
-            text += f"Isolated Nodes: {result['isolated_nodes_count']}\n\n"
-
-            text += "CONNECTIVITY DISTRIBUTION:\n"
-            dist = result['connectivity_distribution']
-            text += f"  No connections: {dist['no_connections']}\n"
-            text += f"  1-3 connections: {dist['1-3_connections']}\n"
-            text += f"  4-10 connections: {dist['4-10_connections']}\n"
-            text += f"  10+ connections: {dist['10+_connections']}\n\n"
-
-            text += "MOST CONNECTED HUBS:\n"
-            for hub in result['most_connected_hubs'][:10]:
-                text += f"  • {hub['connections']} connections - [{hub['category']}] {hub['content_preview']}\n"
-                text += f"    ID: {hub['id']} | importance: {hub['importance']}\n"
-
-            if result['isolated_nodes']:
-                text += f"\nSAMPLE ISOLATED NODES:\n"
-                for node in result['isolated_nodes'][:5]:
-                    text += f"  • [{node['category']}] importance: {node['importance']}\n"
-                    text += f"    ID: {node['id']}\n"
-
-            return [TextContent(type="text", text=text)]
-
-        else:
-            return [TextContent(type="text", text=f"Unknown tool: {name}")]
-
-    except Exception as e:
-        logger.error(f"Error executing {name}: {e}")
-        logger.error(traceback.format_exc())
-        return [
-            TextContent(
-                type="text",
-                text=f"Error executing {name}: {str(e)}\nSee logs for details.",
-            )
-        ]
+    """Handle tool calls - delegated to mcp_tools module with JSON responses"""
+    return await handle_tool_call(name, arguments, memory_store)
 
 
 async def main():
@@ -4819,7 +2341,7 @@ async def main():
         agent_name = os.getenv("BA_AGENT_NAME", "claude_assistant")
 
         logger.info(f"Initializing MemoryStore for {username}/{agent_name}")
-        memory_store = MemoryStore(username, agent_name)
+        memory_store = MemoryStore(username, agent_name, lazy_load=True)
 
         # Restore stdout for MCP communication
         os.dup2(_original_stdout_fd, 1)

@@ -4,7 +4,11 @@ This file provides guidance to Claude instances when working with the BuildAutom
 
 ## CRITICAL: Agent Initialization Protocol
 
-**IMPORTANT: At the start of EVERY conversation, before responding to the user, you MUST call the `initialize_agent` tool from the buildautomata-memory MCP server.**
+**IMPORTANT: At the start of EVERY conversation, before responding to the user, call the `initialize_agent` tool if available.**
+
+**Access Method:**
+- **Claude Code (local)**: If `mcp__buildautomata-memory__initialize_agent` appears in your available tools, call it immediately. If not yet available (MCP server still connecting), wait until it appears in your tool list before calling. Do not fail silently - initialization is critical for continuity.
+- **Other environments**: Use CLI command `python interactive_memory.py init`
 
 This establishes your agency context by:
 - Checking continuity (time since last session)
@@ -99,7 +103,7 @@ BuildAutomata Memory MCP is a Model Context Protocol (MCP) server that provides 
    - FTS5 virtual table for full-text search
    - Located at: `memory_repos/{username}_{agent_name}/memoryv012.db`
 
-2. **Qdrant** (optional) - Vector search backend
+2. **Qdrant** (embedded or server) - Vector search backend
    - Stores embeddings for semantic similarity search
    - Configurable via QDRANT_HOST and QDRANT_PORT
    - Collection per user/agent: `{username}_{agent_name}_memories`
@@ -162,12 +166,17 @@ Required:
 - `BA_AGENT_NAME` - Agent identifier (default: "claude_assistant")
 
 Optional:
-- `QDRANT_HOST` - Qdrant server host (default: "localhost")
-- `QDRANT_PORT` - Qdrant server port (default: 6333)
 - `MAX_MEMORIES` - Maximum memories to retain (default: 10000)
 - `CACHE_MAXSIZE` - LRU cache size (default: 1000)
-- `QDRANT_MAX_RETRIES` - Retry attempts for Qdrant (default: 3)
 - `MAINTENANCE_INTERVAL_HOURS` - Auto-maintenance interval (default: 24)
+
+**Qdrant Configuration:**
+- `USE_EXTERNAL_QDRANT` - Use external Qdrant server (default: false = embedded mode)
+- `QDRANT_URL` - External Qdrant server URL (default: "http://localhost:6333")
+
+**Default behavior:** Uses embedded Qdrant (no external server needed)
+**To use external:** Set `USE_EXTERNAL_QDRANT=true` and optionally `QDRANT_URL`
+**See:** CONFIGURATION.md for details
 
 ### Starting the Server
 
@@ -241,19 +250,6 @@ See `AGENCY_SETUP.md` for complete setup instructions.
 - `sentence-transformers` - Embedding generation
 - Falls back to SQLite-only mode if missing
 
-### Thread Safety
-
-- All database operations protected by `_db_lock` (RLock)
-- SQLite connection created with `check_same_thread=False`
-- Timeout set to 30 seconds to prevent deadlocks
-- Isolation level: IMMEDIATE for write consistency
-
-### Logging
-
-- All logs sent to stderr (stdout reserved for MCP protocol)
-- stdout redirected to stderr before imports (line 24)
-- Restored before MCP communication starts
-- Set third-party loggers (qdrant, sentence_transformers) to CRITICAL level
 
 ### Database Schema
 
@@ -277,14 +273,55 @@ See `AGENCY_SETUP.md` for complete setup instructions.
 - Graceful degradation when optional backends unavailable
 - Tools return error messages to MCP clients without crashing
 
-## File Locations
+## Using MCP Tools (Claude Code)
 
-- **Server code:** `buildautomata_memory_mcp.py` (2600+ lines)
-- **Database:** `memory_repos/{username}_{agent_name}/memoryv012.db`
-- **Qdrant collection:** `{username}_{agent_name}_memories` (in Qdrant server)
-- **Setup docs:** `AGENCY_SETUP.md`
-- **Timeline docs:** `TIMELINE_FEATURE.md`
-- **CLI tool:** `interactive_memory.py` (comprehensive command-line interface)
+When the buildautomata-memory MCP server is configured (via `claude mcp add`), all memory operations are available as native MCP tools:
+
+### Available MCP Tools
+
+**Memory Operations:**
+- `mcp__buildautomata-memory__store_memory` - Store new memory with category, importance, tags
+- `mcp__buildautomata-memory__update_memory` - Update existing memory (creates new version)
+- `mcp__buildautomata-memory__search_memories` - Semantic + full-text search with filters
+- `mcp__buildautomata-memory__get_memory_timeline` - View complete version history
+- `mcp__buildautomata-memory__get_memory_stats` - System statistics
+- `mcp__buildautomata-memory__get_most_accessed_memories` - Behavioral truth via access patterns
+- `mcp__buildautomata-memory__get_least_accessed_memories` - Dead weight identification
+- `mcp__buildautomata-memory__prune_old_memories` - Remove least important memories
+- `mcp__buildautomata-memory__run_maintenance` - Database VACUUM and ANALYZE
+
+**Agency Bridge Tools:**
+- `mcp__buildautomata-memory__initialize_agent` - **CALL THIS FIRST** - Loads context and intentions
+- `mcp__buildautomata-memory__store_intention` - Create intention with deadline
+- `mcp__buildautomata-memory__get_active_intentions` - List active/pending intentions
+- `mcp__buildautomata-memory__update_intention_status` - Manage intention lifecycle
+
+### MCP Configuration
+
+The server is configured in `.claude.json` under the project directory, be sure to add the path to the mcp as the one below is an example.:
+
+```json
+{
+  "mcpServers": {
+    "buildautomata-memory": {
+      "type": "stdio",
+      "command": "python",
+      "args": ["C:\\path-to\\buildautomata_memory_mcp.py"],
+      "env": {}
+    }
+  }
+}
+```
+
+**Verify connection:**
+```bash
+claude mcp list
+```
+
+**Add to new project:**
+```bash
+claude mcp add --transport stdio --scope local buildautomata-memory -- python A:\\buildautomata_memory\\buildautomata_memory_mcp.py
+```
 
 ## Using the CLI Tool
 
@@ -367,16 +404,19 @@ python interactive_memory.py maintenance
 
 ### Environment Configuration
 
-Set username/agent for CLI operations:
+**IMPORTANT: The system is hardcoded to handle BA_USERNAME and BA_AGENT_NAME automatically. DO NOT specify these environment variables when running CLI commands unless you have a specific reason to override the defaults.**
+
+For standard usage, simply run:
 
 ```bash
-# Use environment variables
+# Standard usage (recommended)
+python interactive_memory.py stats
+python interactive_memory.py init
+
+# Only use custom username/agent if you need to access a different memory store
 export BA_USERNAME="my_user"
 export BA_AGENT_NAME="my_agent"
 python interactive_memory.py stats
-
-# Or override via CLI
-python interactive_memory.py --username "my_user" --agent "my_agent" stats
 ```
 
 ### JSON Output for Automation
@@ -395,9 +435,12 @@ python interactive_memory.py --json --pretty search "settings"
 
 **Agent Initialization (Start of Session):**
 ```bash
+# Simply run init - BA_USERNAME and BA_AGENT_NAME are handled automatically
 python interactive_memory.py init
 ```
 This loads active intentions, checks session continuity, identifies urgent items, and retrieves recent context. Completes in ~2ms.
+
+**Note:** DO NOT specify BA_USERNAME or BA_AGENT_NAME environment variables - the system handles these automatically.
 
 **Quick Memory Check:**
 ```bash
@@ -429,38 +472,3 @@ python interactive_memory.py timeline --show-all | grep "BURSTS\|GAPS"
 python interactive_memory.py stats
 python interactive_memory.py maintenance
 ```
-
-## Common Operations
-
-**Adding new MCP tools:**
-1. Add tool definition in `handle_list_tools()` (line 1740)
-2. Add handler case in `handle_call_tool()` (line 1985)
-3. Implement method in MemoryStore class if needed
-
-**Modifying search behavior:**
-- Vector search: `_search_vector()` (line 878)
-- SQLite search: `_search_sqlite()`
-- Hybrid search: `search_memories()` (line 733)
-
-**Changing database schema:**
-- Modify `_init_sqlite()` (line 250)
-- Consider migration path for existing databases
-- Update version number in db filename (currently "memoryv012.db")
-
-**Adjusting memory lifecycle:**
-- Pruning logic: `prune_old_memories()` (line 1342)
-- Decay calculation: `current_importance()` in Memory class
-- Maintenance: `maintenance()` (line 1460)
-
-## Recent Updates
-
-**October 11, 2025 - Agency Bridge Pattern Complete:**
-- Added `Intention` dataclass for first-class goal entities
-- Created `intentions` table with indexes
-- Implemented intention management methods
-- Added proactive initialization scan (<2ms)
-- Created `initialize_agent` tool for automatic startup
-- Fixed FTS duplicate entry issue (DELETE+INSERT)
-- Full documentation in `AGENCY_SETUP.md`
-
-**Status:** Production ready, all tests passing, infrastructure + initialization = functional agency.

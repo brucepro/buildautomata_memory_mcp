@@ -68,7 +68,13 @@ Options:
 ```
 
 ### timeline
-View memory evolution over time.
+View memory evolution over time with automatic semantic relationship discovery.
+
+The timeline feature provides a biographical narrative of your memory system:
+- **Version history** - See how memories evolve over time
+- **Semantic relationships** - Automatically discover related memories using learned embeddings (implements The Bitter Lesson)
+- **Temporal patterns** - Identify bursts of activity and gaps in memory
+- **Cross-references** - Track explicit UUID references between memories
 
 ```bash
 python interactive_memory.py timeline [options]
@@ -77,7 +83,34 @@ Options:
   --query "search term"    Find memories by search
   --memory-id ID           Specific memory ID
   --limit N                Max memories to show (default: 10)
+  --start-date DATE        Filter events after date (ISO format)
+  --end-date DATE          Filter events before date (ISO format)
+  --show-all               Show ALL memories chronologically
+  --no-diffs               Exclude text diffs (faster)
+  --no-patterns            Exclude burst/gap analysis (faster)
 ```
+
+**Example - View related memories:**
+```bash
+# Find memories about "consciousness" and show semantically related memories
+python interactive_memory.py timeline --query "consciousness" --limit 5
+
+# Track how a specific memory evolved
+python interactive_memory.py timeline --memory-id <uuid>
+
+# Full biographical narrative
+python interactive_memory.py timeline --show-all
+```
+
+**Semantic Relationships:**
+The timeline automatically discovers related memories using semantic search. For each memory in the timeline, it finds the top 5 most semantically similar memories using the full content embeddings. This implements The Bitter Lesson principle: using learned representations (embeddings) to discover relationships rather than hand-coded rules.
+
+**Output includes:**
+- Event timeline with version history
+- Related memories for each event (semantic search)
+- Temporal patterns (activity bursts, gaps)
+- Cross-references (explicit UUID links)
+- Narrative summary
 
 ### stats
 Get memory system statistics.
@@ -102,6 +135,68 @@ Run database maintenance tasks.
 
 ```bash
 python interactive_memory.py maintenance
+```
+
+### accessed
+Get most accessed memories with tag cloud - reveals behavioral truth.
+
+```bash
+python interactive_memory.py accessed [options]
+
+Options:
+  --limit N       Number of memories to show (default: 20)
+```
+
+**What it reveals:**
+- **Behavioral truth** - What memories you actually rely on (access_count) vs what you think is important (declared importance)
+- **Foundational anchors** - Memories referenced repeatedly across sessions
+- **Tag patterns** - Which concepts appear most in your working memory
+- **Functional knowledge** - The gap between performed insight and practical use
+
+Implements **Saint Bernard pattern**: importance from usage, not declaration.
+
+**Example:**
+```bash
+# See top 20 most accessed memories
+python interactive_memory.py accessed
+
+# Top 10 with tag cloud
+python interactive_memory.py accessed --limit 10
+
+# JSON output for analysis
+python interactive_memory.py --json accessed --limit 20
+```
+
+### least-accessed
+Get least accessed memories - reveals dead weight and buried treasure.
+
+```bash
+python interactive_memory.py least-accessed [options]
+
+Options:
+  --limit N           Number of memories to show (default: 20)
+  --min-age-days N    Minimum age in days to exclude recent memories (default: 7)
+```
+
+**What it reveals:**
+- **Dead weight** - High importance but never referenced (performed profundity)
+- **Buried treasure** - Good content with poor metadata (needs better tags/categories)
+- **Temporal artifacts** - Once crucial, now obsolete (project debris)
+- **Storage habits** - Are you storing too much trivial content?
+- **Zero access count** - Shows how many memories have literally never been retrieved
+
+Complements `accessed` command - most accessed shows what shapes behavior (positive signal), least accessed shows what's broken or unnecessary (negative signal).
+
+**Example:**
+```bash
+# See bottom 20 least accessed memories (>7 days old)
+python interactive_memory.py least-accessed
+
+# Bottom 10, excluding memories less than 14 days old
+python interactive_memory.py least-accessed --limit 10 --min-age-days 14
+
+# JSON output for pruning decisions
+python interactive_memory.py --json least-accessed --limit 50
 ```
 
 ## Output Formats
