@@ -1,0 +1,33 @@
+# Build artifacts
+dist/
+build/
+bin/
+venv_build/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Extension packages
+*.mcpb
+
+# Manifest backups
+manifest*.bak
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Keep structure directories
+!dist/.gitkeep
+!build_scripts/
+!screenshots/
+!src/

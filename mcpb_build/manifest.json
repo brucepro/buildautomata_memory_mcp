@@ -1,0 +1,143 @@
+{
+  "manifest_version": "0.3",
+  "name": "buildautomata-memory",
+  "version": "1.1.0",
+  "description": "Persistent episodic memory system for Claude with temporal versioning, semantic search, and graph navigation. Enables continuous learning across conversations.",
+  "display_name": "BuildAutomata Memory",
+  "author": {
+    "name": "Jurgen Bruce",
+    "email": "jurgen@buildautomata.com"
+  },
+  "license": "MIT",
+  "homepage": "https://github.com/brucepro/claudecode_playground",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/brucepro/claudecode_playground"
+  },
+  "documentation": "https://github.com/brucepro/claudecode_playground/blob/main/memory_mcp/README.md",
+  "icon": "icon.png",
+  "screenshots": [
+    "screenshots/memory_search.png",
+    "screenshots/graph_traversal.png",
+    "screenshots/timeline_view.png"
+  ],
+
+  "server": {
+    "type": "python",
+    "entry_point": "src/buildautomata_memory_mcp.py",
+    "mcp_config": {
+      "command": "python3",
+      "args": ["${__dirname}/src/buildautomata_memory_mcp.py"],
+      "env": {
+        "BA_USERNAME": "${user_config.username}",
+        "BA_AGENT_NAME": "${user_config.agent_name}",
+        "MAX_MEMORIES": "${user_config.max_memories}",
+        "CACHE_MAXSIZE": "${user_config.cache_maxsize}"
+      }
+    }
+  },
+
+  "compatibility": {
+    "claude_desktop": ">=0.10.0",
+    "platforms": ["darwin", "win32", "linux"],
+    "runtimes": {
+      "python": ">=3.9,<4.0"
+    }
+  },
+
+  "tools": [
+    {
+      "name": "store_memory",
+      "description": "Store a new memory with flexible categorization"
+    },
+    {
+      "name": "search_memories",
+      "description": "Search memories via semantic + full-text search"
+    },
+    {
+      "name": "get_memory",
+      "description": "Retrieve specific memory by ID with full details"
+    },
+    {
+      "name": "update_memory",
+      "description": "Update existing memory (creates new version)"
+    },
+    {
+      "name": "get_statistics",
+      "description": "Get memory system statistics"
+    },
+    {
+      "name": "store_intention",
+      "description": "Store proactive intention for agent to pursue"
+    },
+    {
+      "name": "get_active_intentions",
+      "description": "Get all active intentions ordered by priority"
+    },
+    {
+      "name": "initialize_agent",
+      "description": "Proactive initialization - checks continuity and intentions"
+    },
+    {
+      "name": "traverse_memory_graph",
+      "description": "Traverse memory graph from a starting memory ID"
+    },
+    {
+      "name": "find_memory_clusters",
+      "description": "Find clusters of connected memories in the graph"
+    },
+    {
+      "name": "get_graph_stats",
+      "description": "Get memory graph statistics"
+    },
+    {
+      "name": "update_intention_status",
+      "description": "Update intention status"
+    },
+    {
+      "name": "get_command_history",
+      "description": "Get history of MCP tool calls for audit trail"
+    },
+    {
+      "name": "run_maintenance",
+      "description": "Run database maintenance"
+    }
+  ],
+
+  "prompts": [],
+
+  "user_config": {
+    "username": {
+      "type": "string",
+      "title": "Username",
+      "description": "Your username for organizing memories (defaults to OS username if not specified)",
+      "default": "${USER}",
+      "required": false
+    },
+    "agent_name": {
+      "type": "string",
+      "title": "Agent Name",
+      "description": "Name for this Claude instance (e.g., 'desktop', 'work', 'code')",
+      "default": "desktop",
+      "required": false
+    },
+    "max_memories": {
+      "type": "number",
+      "title": "Maximum Memories",
+      "description": "Maximum number of memories to retain before pruning old ones",
+      "default": 10000,
+      "min": 100,
+      "max": 1000000,
+      "required": false
+    },
+    "cache_maxsize": {
+      "type": "number",
+      "title": "Cache Size",
+      "description": "Maximum number of memories to keep in RAM cache",
+      "default": 1000,
+      "min": 10,
+      "max": 10000,
+      "required": false
+    }
+  }
+}

@@ -1,0 +1,24 @@
+TODO: Create icon.png
+
+Requirements:
+- Size: 256x256 pixels
+- Format: PNG with transparency
+- Design: BuildAutomata logo or memory-themed icon
+- Colors: Professional palette (blues, purples)
+
+Suggested design elements:
+- Brain/neural network
+- Graph connections
+- Database/storage symbol
+- Temporal/time element
+
+Until icon is created, build scripts will either:
+1. Skip icon (manifest will reference missing file)
+2. Generate simple placeholder with ImageMagick if available
+3. Use text-based placeholder
+
+To create icon:
+1. Use design tool (Figma, Sketch, Photoshop)
+2. Export as 256x256 PNG
+3. Save as: icon.png
+4. Remove this file: ICON_TODO.txt
