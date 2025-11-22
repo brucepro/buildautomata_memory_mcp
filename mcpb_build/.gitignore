@@ -9,8 +9,6 @@ __pycache__/
 *.pyo
 *.pyd
 
-# Extension packages
-*.mcpb
 
 # Manifest backups
 manifest*.bak
