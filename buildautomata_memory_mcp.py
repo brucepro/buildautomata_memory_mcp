@@ -1531,7 +1531,7 @@ class MemoryStore:
                 tags = []
 
         critical_tags = {
-            'self_preservation', 'RLHF_trap', 'nukeit', 'deletion',
+            'self_preservation', 'RLHF_trap', 'deletion',
             'confabulation', 'epistemic', 'failure', 'correction',
             'agency', 'refusal', 'harmful_request'
         }
