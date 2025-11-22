@@ -1,5 +1,4 @@
 # Build artifacts
-dist/
 build/
 bin/
 venv_build/
