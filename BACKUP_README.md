@@ -102,6 +102,27 @@ python restore_memory.py backup_20251024_191534.zip
 
 ---
 
+## Qdrant Mode Detection
+
+The backup and restore tools automatically detect your Qdrant configuration:
+
+### Embedded Mode (Default)
+- **No configuration needed** - Works out of the box
+- Qdrant data stored locally in `memory_repos/{user}_{agent}/qdrant_data/`
+- No external server required
+
+### External Mode
+Set environment variable to use external Qdrant server:
+```bash
+export USE_EXTERNAL_QDRANT=true
+export QDRANT_HOST=localhost     # Optional, defaults to localhost
+export QDRANT_PORT=6333          # Optional, defaults to 6333
+```
+
+**Note:** Both backup and restore will use the same mode as your current configuration. To backup from external and restore to embedded (or vice versa), change the environment variables before running the restore command.
+
+---
+
 ## Use Cases
 
 ### 1. Regular Backups

@@ -70,14 +70,25 @@ class BatchGraphBuilder:
         # Initialize Qdrant if available
         if QDRANT_AVAILABLE:
             try:
-                qdrant_host = os.getenv("QDRANT_HOST", "localhost")
-                qdrant_port = int(os.getenv("QDRANT_PORT", 6333))
                 username = os.getenv("BA_USERNAME", "buildautomata_ai_v012")
                 agent_name = os.getenv("BA_AGENT_NAME", "claude_assistant")
                 self.collection_name = f"{username}_{agent_name}_memories"
 
-                self.qdrant_client = QdrantClient(host=qdrant_host, port=qdrant_port)
-                print(f"Connected to Qdrant at {qdrant_host}:{qdrant_port}, collection: {self.collection_name}")
+                # Detect Qdrant mode: embedded (default) or external
+                use_external = os.getenv("USE_EXTERNAL_QDRANT", "").lower() in ("true", "1", "yes")
+
+                if use_external:
+                    # External Qdrant mode
+                    qdrant_host = os.getenv("QDRANT_HOST", "localhost")
+                    qdrant_port = int(os.getenv("QDRANT_PORT", 6333))
+                    self.qdrant_client = QdrantClient(host=qdrant_host, port=qdrant_port)
+                    print(f"Connected to external Qdrant at {qdrant_host}:{qdrant_port}, collection: {self.collection_name}")
+                else:
+                    # Embedded Qdrant mode (default)
+                    repo_dir = Path(__file__).parent / "memory_repos" / f"{username}_{agent_name}"
+                    qdrant_path = str(repo_dir / "qdrant_data")
+                    self.qdrant_client = QdrantClient(path=qdrant_path)
+                    print(f"Using embedded Qdrant at {qdrant_path}, collection: {self.collection_name}")
             except Exception as e:
                 print(f"Qdrant connection failed: {e}, falling back to SQLite-only")
                 self.qdrant_client = None

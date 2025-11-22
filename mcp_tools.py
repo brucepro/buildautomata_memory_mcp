@@ -185,6 +185,11 @@ def get_tool_definitions() -> List[Tool]:
                 },
             },
         ),
+        Tool(
+            name="run_maintenance",
+            description="Run database maintenance (VACUUM, ANALYZE, repair missing embeddings). Call this periodically to optimize performance and fix vector search issues.",
+            inputSchema={"type": "object", "properties": {}},
+        ),
     ]
 
 
@@ -305,10 +310,15 @@ async def handle_tool_call(name: str, arguments: Dict[str, Any], memory_store) -
             return [TextContent(type="text", text=json.dumps(result, indent=2, cls=DateTimeEncoder))]
 
         elif name == "update_intention_status":
+            # Convert notes to metadata_updates format for backend
+            metadata_updates = None
+            if arguments.get("notes"):
+                metadata_updates = {"status_notes": arguments["notes"]}
+
             result = await memory_store.update_intention_status(
                 intention_id=arguments["intention_id"],
                 status=arguments["status"],
-                notes=arguments.get("notes"),
+                metadata_updates=metadata_updates,
             )
             _log_command(memory_store, name, arguments, "status_updated", None, True)
             return [TextContent(type="text", text=json.dumps(result, indent=2, cls=DateTimeEncoder))]
@@ -321,6 +331,11 @@ async def handle_tool_call(name: str, arguments: Dict[str, Any], memory_store) -
                 end_date=arguments.get("end_date"),
             )
             # Don't log get_command_history calls to avoid noise
+            return [TextContent(type="text", text=json.dumps(result, indent=2, cls=DateTimeEncoder))]
+
+        elif name == "run_maintenance":
+            result = await memory_store.maintenance()
+            _log_command(memory_store, name, arguments, "maintenance_complete", None, True)
             return [TextContent(type="text", text=json.dumps(result, indent=2, cls=DateTimeEncoder))]
 
         else:

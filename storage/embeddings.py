@@ -11,11 +11,14 @@ from datetime import datetime
 
 logger = logging.getLogger("buildautomata-memory.embeddings")
 
+# Check availability without importing the heavy library
 try:
-    from sentence_transformers import SentenceTransformer
-    EMBEDDINGS_AVAILABLE = True
-except ImportError:
+    import importlib.util
+    EMBEDDINGS_AVAILABLE = importlib.util.find_spec("sentence_transformers") is not None
+except Exception:
     EMBEDDINGS_AVAILABLE = False
+
+if not EMBEDDINGS_AVAILABLE:
     logger.warning("SentenceTransformers not available - using fallback embeddings")
 
 
@@ -61,6 +64,9 @@ class EmbeddingGenerator:
             return
 
         try:
+            # Import only when actually needed (lazy loading)
+            from sentence_transformers import SentenceTransformer
+
             self.encoder = SentenceTransformer("all-mpnet-base-v2", device="cpu")
             # Model dimension is fixed at 768 for all-mpnet-base-v2
             # Only test if config disagrees (first-time init or model change)

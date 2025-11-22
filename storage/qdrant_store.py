@@ -11,20 +11,14 @@ from datetime import datetime
 
 logger = logging.getLogger("buildautomata-memory.qdrant")
 
+# Check availability without importing the heavy library
 try:
-    from qdrant_client import QdrantClient
-    from qdrant_client.models import (
-        Distance,
-        VectorParams,
-        PointStruct,
-        Filter,
-        FieldCondition,
-        Range,
-        DatetimeRange,
-    )
-    QDRANT_AVAILABLE = True
-except ImportError:
+    import importlib.util
+    QDRANT_AVAILABLE = importlib.util.find_spec("qdrant_client") is not None
+except Exception:
     QDRANT_AVAILABLE = False
+
+if not QDRANT_AVAILABLE:
     logger.warning("Qdrant not available - vector search disabled")
 
 
@@ -75,6 +69,10 @@ class QdrantStore:
         if not QDRANT_AVAILABLE:
             logger.warning("Qdrant libraries not available")
             return
+
+        # Import only when actually needed (lazy loading)
+        from qdrant_client import QdrantClient
+        from qdrant_client.models import Distance, VectorParams
 
         import os
 
@@ -131,6 +129,9 @@ class QdrantStore:
         if not self.client:
             return False
 
+        # Import models when needed (after initialization)
+        from qdrant_client.models import PointStruct
+
         if max_retries is None:
             max_retries = self.config.get("qdrant_max_retries", 3)
 
@@ -163,6 +164,9 @@ class QdrantStore:
 
         if not self.client or not points:
             return False
+
+        # Import models when needed (after initialization)
+        from qdrant_client.models import PointStruct
 
         try:
             qdrant_points = [
@@ -202,6 +206,9 @@ class QdrantStore:
 
         if not self.client:
             return []
+
+        # Import models when needed (after initialization)
+        from qdrant_client.models import Filter
 
         try:
             search_filter = Filter(must=filter_conditions) if filter_conditions else None

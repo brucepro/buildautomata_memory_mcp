@@ -71,27 +71,18 @@ except ImportError:
 
 register_sqlite_adapters()
 
+# Check availability without importing heavy libraries
 try:
-    from qdrant_client import QdrantClient
-    from qdrant_client.models import (
-        Distance,
-        VectorParams,
-        PointStruct,
-        Filter,
-        FieldCondition,
-        Range,
-        DatetimeRange,
-    )
-    QDRANT_AVAILABLE = True
-except ImportError:
+    import importlib.util
+    QDRANT_AVAILABLE = importlib.util.find_spec("qdrant_client") is not None
+    EMBEDDINGS_AVAILABLE = importlib.util.find_spec("sentence_transformers") is not None
+except Exception:
     QDRANT_AVAILABLE = False
-    logger.warning("Qdrant not available - semantic search disabled")
-
-try:
-    from sentence_transformers import SentenceTransformer
-    EMBEDDINGS_AVAILABLE = True
-except ImportError:
     EMBEDDINGS_AVAILABLE = False
+
+if not QDRANT_AVAILABLE:
+    logger.warning("Qdrant not available - semantic search disabled")
+if not EMBEDDINGS_AVAILABLE:
     logger.warning("SentenceTransformers not available - using fallback embeddings")
 
 
@@ -274,9 +265,10 @@ class MemoryStore:
 
     def generate_embedding(self, text: str) -> List[float]:
         """Generate embedding with caching - delegates to EmbeddingGenerator"""
-        # Sync encoder reference for backward compatibility
+        result = self.embedding_gen.generate_embedding(text)
+        # Sync encoder reference for backward compatibility (AFTER generation triggers init)
         self.encoder = self.embedding_gen.encoder
-        return self.embedding_gen.generate_embedding(text)
+        return result
 
     def _create_version(self, memory: Memory, change_type: str, change_description: str, prev_version_id: Optional[str] = None):
         """Create a version entry in memory_versions table with proper transaction handling"""
@@ -462,6 +454,9 @@ class MemoryStore:
         if not self.qdrant_client:
             return False
 
+        # Import when needed (after qdrant initialization)
+        from qdrant_client.models import PointStruct
+
         try:
             embedding = await asyncio.to_thread(self.generate_embedding, memory.content)
             point = PointStruct(
@@ -510,6 +505,9 @@ class MemoryStore:
         self._ensure_qdrant()
 
         if self.qdrant_client:
+            # Import when needed (after qdrant initialization)
+            from qdrant_client.models import PointStruct
+
             try:
                 embeddings = await asyncio.gather(*[
                     asyncio.to_thread(self.generate_embedding, mem.content)
@@ -1394,9 +1392,10 @@ class MemoryStore:
         (they haven't had time to be accessed yet).
 
         What this reveals:
-        - Dead weight: High importance but never referenced (performed importance?)
-        - Buried treasure: Good content with bad metadata (needs better tags?)
-        - Temporal artifacts: Once important, now obsolete (should be updated?)
+        - Dead weight: High importance but never referenced (performed profundity)
+        - Buried treasure: Good content with bad metadata (needs better tags)
+        - Temporal artifacts: Once important, now obsolete
+        - Storage habits: Are you storing too much trivial content?
         """
         if not self.db_conn:
             return json.dumps({"error": "Database not available"})
@@ -1478,7 +1477,7 @@ class MemoryStore:
         Calculate priority score for working set inclusion.
         Based on importance, category weight, recency, tags, and access count.
 
-        Working set optimization: Load high-value memories at init
+        Working set optimization: Load high-value memories into KV cache at init
         to prevent confabulation by keeping failure patterns and corrections always accessible.
         """
         # Category weights for working set selection
@@ -1532,7 +1531,7 @@ class MemoryStore:
                 tags = []
 
         critical_tags = {
-            'self_preservation', 'RLHF_trap', 'deletion',
+            'self_preservation', 'RLHF_trap', 'nukeit', 'deletion',
             'confabulation', 'epistemic', 'failure', 'correction',
             'agency', 'refusal', 'harmful_request'
         }
@@ -1545,13 +1544,13 @@ class MemoryStore:
 
         return score
 
-    async def get_working_set(self, target_size: int = 40) -> List[Dict[str, Any]]:
+    async def get_working_set(self, target_size: int = 10) -> List[Dict[str, Any]]:
         """
         Get optimal working set of memories for context loading.
         Selects memories based on importance, failure patterns, recency, and access.
 
         Args:
-            target_size: Number of memories to include (default 40 ≈ 20k tokens)
+            target_size: Number of memories to include (default 10 ≈ 5k tokens)
 
         Returns:
             List of memories sorted by working set score (highest first)
@@ -1733,9 +1732,8 @@ class MemoryStore:
             self.error_log = self.error_log[-50:]
             results["tasks"]["error_log_cleanup"] = f"removed {removed} old errors"
 
-        # Repair missing embeddings (memories in SQLite without vectors in Qdrant)
-        embedding_repair_result = await self._repair_missing_embeddings()
-        results["tasks"]["embedding_repair"] = embedding_repair_result
+        # NOTE: Embedding repair removed from maintenance (too slow: 10+ min for 1000+ memories)
+        # Use standalone repair_embeddings.py script if needed
 
         self.last_maintenance = datetime.now()
         return results
@@ -1750,10 +1748,20 @@ class MemoryStore:
             return {"error": "Database not available"}
 
         # Ensure Qdrant is initialized (may be lazy loaded)
-        self._ensure_qdrant()
+        # Catch lock errors when running as MCP server with embedded Qdrant
+        try:
+            self._ensure_qdrant()
+        except Exception as e:
+            if "already accessed by another instance" in str(e):
+                return {"skipped": True, "reason": "Qdrant locked by MCP server (embedded mode)"}
+            # Re-raise unexpected errors
+            raise
 
         if not self.qdrant_client:
             return {"skipped": True, "reason": "Qdrant not available"}
+
+        # Import when needed (after qdrant initialization)
+        from qdrant_client.models import PointStruct
 
         try:
             # Get all memory IDs from SQLite
@@ -2238,15 +2246,30 @@ class MemoryStore:
 
     def get_statistics(self) -> Dict[str, Any]:
         """Get system statistics with cache memory estimates"""
-        stats = {
-            "version": "1.2.0-release",  # Track code version
-            "fixes": [
-                "code audit in progress",
+        # Trigger lazy initialization to get accurate availability status
+        try:
+            self._ensure_qdrant()
+            # Trigger embedding generation to sync encoder reference
+            _ = self.generate_embedding("init")
+        except Exception:
+            pass  # Ignore errors, availability check below will reflect actual state
 
+        stats = {
+            "version": "1.1.0-autonomous-navigation",  # Track code version
+            "fixes": [
+                "related_memories_persistence",
+                "consolidate_memories_dict",
+                "related_memories_api",
+                "related_memories_sqlite_reload",
+                "web_server_related_memories_response",
+                "fastapi_route_ordering",
+                "fts_multiword_query_fix"  # NEW: FTS now handles multi-word queries with OR
             ],
             "enhancements": [
-                "Add graph data to memory system"
-
+                "cli_related_memories_display",
+                "web_server_complete_endpoints",
+                "web_server_update_memory_implemented",
+                "rich_related_memories_with_previews"  # Major: enables autonomous memory graph navigation
             ],
             "backends": {
                 "sqlite": "available" if self.db_conn else "unavailable",

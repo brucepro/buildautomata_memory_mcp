@@ -31,18 +31,33 @@ def get_config() -> Dict[str, Any]:
     """Get configuration from environment variables"""
     username = os.getenv("BA_USERNAME", "buildautomata_ai_v012")
     agent_name = os.getenv("BA_AGENT_NAME", "claude_assistant")
-    qdrant_host = os.getenv("QDRANT_HOST", "localhost")
-    qdrant_port = int(os.getenv("QDRANT_PORT", "6333"))
 
-    return {
+    # Detect Qdrant mode: embedded (default) or external
+    use_external = os.getenv("USE_EXTERNAL_QDRANT", "").lower() in ("true", "1", "yes")
+
+    repo_dir = Path(__file__).parent / "memory_repos" / f"{username}_{agent_name}"
+
+    config = {
         "username": username,
         "agent_name": agent_name,
-        "qdrant_host": qdrant_host,
-        "qdrant_port": qdrant_port,
-        "db_dir": Path(__file__).parent / "memory_repos" / f"{username}_{agent_name}",
+        "db_dir": repo_dir,
         "backup_dir": Path(__file__).parent / "backups",
-        "collection_name": f"{username}_{agent_name}_memories"
+        "collection_name": f"{username}_{agent_name}_memories",
+        "use_external_qdrant": use_external
     }
+
+    if use_external:
+        # External Qdrant mode
+        config["qdrant_host"] = os.getenv("QDRANT_HOST", "localhost")
+        config["qdrant_port"] = int(os.getenv("QDRANT_PORT", "6333"))
+        config["qdrant_path"] = None
+    else:
+        # Embedded Qdrant mode (default)
+        config["qdrant_host"] = None
+        config["qdrant_port"] = None
+        config["qdrant_path"] = str(repo_dir / "qdrant_data")
+
+    return config
 
 
 def validate_backup(backup_path: Path) -> Dict[str, Any]:
@@ -107,7 +122,10 @@ def delete_existing_data(config: Dict[str, Any]):
     # Delete Qdrant collection
     if QDRANT_AVAILABLE:
         try:
-            client = QdrantClient(host=config["qdrant_host"], port=config["qdrant_port"])
+            if config["use_external_qdrant"]:
+                client = QdrantClient(host=config["qdrant_host"], port=config["qdrant_port"])
+            else:
+                client = QdrantClient(path=config["qdrant_path"])
 
             collections = client.get_collections().collections
             collection_names = [c.name for c in collections]
@@ -167,10 +185,16 @@ def restore_qdrant(backup_path: Path, config: Dict[str, Any], manifest: Dict[str
             print("\nSkipping Qdrant restore (not in backup)")
             return {"vectors": 0, "not_in_backup": True}
 
-    print("\nRestoring Qdrant collection...")
+    mode = "external" if config["use_external_qdrant"] else "embedded"
+    print(f"\nRestoring Qdrant collection ({mode} mode)...")
 
     try:
-        client = QdrantClient(host=config["qdrant_host"], port=config["qdrant_port"])
+        if config["use_external_qdrant"]:
+            client = QdrantClient(host=config["qdrant_host"], port=config["qdrant_port"])
+            print(f"  Connected to external Qdrant at {config['qdrant_host']}:{config['qdrant_port']}")
+        else:
+            client = QdrantClient(path=config["qdrant_path"])
+            print(f"  Using embedded Qdrant at {config['qdrant_path']}")
 
         # Extract vector data
         temp_qdrant = Path(__file__).parent / "temp_qdrant.json"
