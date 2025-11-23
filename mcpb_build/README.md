@@ -101,7 +101,15 @@ mcpb_build/
 
 ## License
 
-Same as main BuildAutomata Memory MCP project.
+Copyright (c) 2025 Jurden Bruce
+
+This software uses a custom license allowing:
+- **Free use** for personal, educational, and small business (<$100k revenue) purposes
+- **Paid licensing** required for companies with $100k+ annual revenue
+
+See [LICENSE](LICENSE) file for full terms.
+
+For commercial licensing: sales@brucepro.net
 
 ## Contributing
 

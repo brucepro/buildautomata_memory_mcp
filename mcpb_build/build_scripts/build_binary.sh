@@ -82,8 +82,8 @@ cat > manifest_binary.json << 'EOF'
   "name": "buildautomata-memory",
   "version": "1.1.0",
   "description": "Persistent episodic memory system for Claude with temporal versioning, semantic search, and graph navigation. Standalone binary - no Python required.",
-  "author": "Jurgen Bruce",
-  "license": "MIT",
+  "author": "Jurden Bruce",
+  "license": "Custom",
   "homepage": "https://github.com/brucepro/claudecode_playground",
   "icon": "icon.png",
 

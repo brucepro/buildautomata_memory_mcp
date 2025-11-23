@@ -19,7 +19,7 @@
 {
   "name": "buildautomata-memory",
   "version": "1.1.0",
-  "author": "Jurgen Bruce"
+  "author": "Jurden Bruce"
 }
 ```
 
@@ -31,7 +31,7 @@
   "version": "1.1.0",
   "display_name": "BuildAutomata Memory",  // ✅ ADDED - Optional but recommended
   "author": {  // ✅ FIXED - Must be object with 'name' field
-    "name": "Jurgen Bruce",
+    "name": "Jurden Bruce",
     "email": "jurgen@buildautomata.com"
   }
 }
@@ -106,7 +106,7 @@ memory_repos/username_agent/
 - [x] `name` - "buildautomata-memory"
 - [x] `version` - "1.1.0"
 - [x] `description` - Full description provided
-- [x] `author.name` - "Jurgen Bruce"
+- [x] `author.name` - "Jurden Bruce"
 
 ### Server Configuration
 - [x] `server.type` - "python"

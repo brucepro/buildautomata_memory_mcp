@@ -5,10 +5,10 @@
   "description": "Persistent episodic memory system for Claude with temporal versioning, semantic search, and graph navigation. Enables continuous learning across conversations.",
   "display_name": "BuildAutomata Memory",
   "author": {
-    "name": "Jurgen Bruce",
-    "email": "jurgen@buildautomata.com"
+    "name": "Jurden Bruce",
+    "email": "sales@brucepro.net"
   },
-  "license": "MIT",
+  "license": "Custom",
   "homepage": "https://github.com/brucepro/claudecode_playground",
   "repository": {
     "type": "git",
@@ -26,7 +26,7 @@
     "type": "python",
     "entry_point": "src/buildautomata_memory_mcp.py",
     "mcp_config": {
-      "command": "python3",
+      "command": "python",
       "args": ["${__dirname}/src/buildautomata_memory_mcp.py"],
       "env": {
         "BA_USERNAME": "${user_config.username}",
@@ -41,7 +41,7 @@
     "claude_desktop": ">=0.10.0",
     "platforms": ["darwin", "win32", "linux"],
     "runtimes": {
-      "python": ">=3.9,<4.0"
+      "python": ">=3.9"
     }
   },
 
