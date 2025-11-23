@@ -1197,17 +1197,8 @@ class MemoryStore:
                 cursor = self.db_conn.execute(sql, params)
                 memories = [self._row_to_memory(row) for row in cursor.fetchall()]
 
-                # Convert to dicts with full context
-                result = []
-                for mem in memories:
-                    mem_dict = mem.to_dict()
-                    # Include version history for session reconstruction
-                    version_history = await asyncio.to_thread(
-                        self._get_version_history_summary, mem.id
-                    )
-                    if version_history:
-                        mem_dict["version_history"] = version_history
-                    result.append(mem_dict)
+                # Convert to dicts - fast SQLite-only operation
+                result = [mem.to_dict() for mem in memories]
 
                 logger.info(f"Retrieved {len(result)} memories for session/period")
                 return result
@@ -2077,6 +2068,12 @@ class MemoryStore:
             include_semantic_relations: If True (default), find semantically related memories
                                         to expose memory network. Expensive but valuable for AI context.
         """
+        # DEBUG: Log types of date parameters
+        if start_date is not None:
+            logger.info(f"[TIMELINE DEBUG] start_date type: {type(start_date)}, value: {start_date}")
+        if end_date is not None:
+            logger.info(f"[TIMELINE DEBUG] end_date type: {type(end_date)}, value: {end_date}")
+
         if not self.db_conn:
             return {"error": "Database not available"}
 
@@ -2187,10 +2184,16 @@ class MemoryStore:
                 filtered_events = []
                 for event in all_events:
                     event_dt = datetime.fromisoformat(event['timestamp'])
-                    if start_date and event_dt < datetime.fromisoformat(start_date):
-                        continue
-                    if end_date and event_dt > datetime.fromisoformat(end_date):
-                        continue
+                    if start_date:
+                        # Ensure start_date is a string
+                        start_dt = datetime.fromisoformat(start_date) if isinstance(start_date, str) else start_date
+                        if event_dt < start_dt:
+                            continue
+                    if end_date:
+                        # Ensure end_date is a string
+                        end_dt = datetime.fromisoformat(end_date) if isinstance(end_date, str) else end_date
+                        if event_dt > end_dt:
+                            continue
                     filtered_events.append(event)
                 all_events = filtered_events
 

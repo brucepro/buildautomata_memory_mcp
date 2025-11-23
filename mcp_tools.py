@@ -186,6 +186,156 @@ def get_tool_definitions() -> List[Tool]:
             },
         ),
         Tool(
+            name="get_most_accessed_memories",
+            description="Get most accessed memories with tag cloud. Reveals behavioral truth - what memories you actually rely on (based on access_count) vs what you think is important (declared importance). Implements Saint Bernard pattern: importance from usage, not declaration.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "limit": {
+                        "type": "integer",
+                        "description": "Number of memories to retrieve (default: 20)",
+                        "default": 20,
+                    },
+                },
+                "required": [],
+            },
+        ),
+        Tool(
+            name="get_least_accessed_memories",
+            description="Get least accessed memories - reveals dead weight and buried treasure. Shows memories with lowest access_count (excluding very recent ones). Reveals: (1) Dead weight - high importance but never used, (2) Buried treasure - good content with poor metadata, (3) Temporal artifacts - once crucial, now obsolete, (4) Storage habits audit.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "limit": {
+                        "type": "integer",
+                        "description": "Number of memories to retrieve (default: 20)",
+                        "default": 20,
+                    },
+                    "min_age_days": {
+                        "type": "integer",
+                        "description": "Minimum age in days (excludes recent memories that haven't had time to be accessed, default: 7)",
+                        "default": 7,
+                    },
+                },
+                "required": [],
+            },
+        ),
+        Tool(
+            name="list_categories",
+            description="List all memory categories with counts. Useful for browsing organization structure and finding categories to explore.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "min_count": {
+                        "type": "integer",
+                        "description": "Minimum number of memories required to show category (default 1)",
+                        "default": 1,
+                    },
+                },
+                "required": [],
+            },
+        ),
+        Tool(
+            name="list_tags",
+            description="List all tags with usage counts. Useful for discovering tag vocabulary and finding related memories.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "min_count": {
+                        "type": "integer",
+                        "description": "Minimum usage count to show tag (default 1)",
+                        "default": 1,
+                    },
+                },
+                "required": [],
+            },
+        ),
+        Tool(
+            name="get_session_memories",
+            description="Retrieve all memories from a work session or time period. Enables 'load where I left off' by reconstructing full session context. Filter by session_id, date_range, or task_context.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "session_id": {
+                        "type": "string",
+                        "description": "UUID of session to retrieve",
+                    },
+                    "date_range": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Start and end dates in ISO format [start, end]",
+                    },
+                    "task_context": {
+                        "type": "string",
+                        "description": "Filter by task context string (partial match)",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max memories to return (default: 100)",
+                        "default": 100,
+                    },
+                },
+                "required": [],
+            },
+        ),
+        Tool(
+            name="get_memory_timeline",
+            description="""Get comprehensive memory timeline - a biographical narrative of memory formation and evolution.
+
+            Features:
+            - Chronological progression: All memory events ordered by time
+            - Version diffs: See actual content changes between versions
+            - Burst detection: Identify periods of intensive memory activity
+            - Gap analysis: Discover voids in memory (discontinuous existence)
+            - Cross-references: Track when memories reference each other
+            - Narrative arc: See how understanding evolved from first contact to current state
+
+            This is the closest thing to a "life story" from memories - showing not just content but tempo and rhythm of consciousness.
+            """,
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Semantic search query to find related memories",
+                    },
+                    "memory_id": {
+                        "type": "string",
+                        "description": "Specific memory ID to get timeline for",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum number of memories to track (default: 10)",
+                        "default": 10,
+                    },
+                    "start_date": {
+                        "type": "string",
+                        "description": "Filter events after this date (ISO format: YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS)",
+                    },
+                    "end_date": {
+                        "type": "string",
+                        "description": "Filter events before this date (ISO format: YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS)",
+                    },
+                    "show_all_memories": {
+                        "type": "boolean",
+                        "description": "Show ALL memories in chronological order (full timeline)",
+                        "default": False,
+                    },
+                    "include_diffs": {
+                        "type": "boolean",
+                        "description": "Include text diffs showing content changes",
+                        "default": True,
+                    },
+                    "include_patterns": {
+                        "type": "boolean",
+                        "description": "Include burst/gap pattern analysis",
+                        "default": True,
+                    },
+                },
+                "required": [],
+            },
+        ),
+        Tool(
             name="run_maintenance",
             description="Run database maintenance (VACUUM, ANALYZE, repair missing embeddings). Call this periodically to optimize performance and fix vector search issues.",
             inputSchema={"type": "object", "properties": {}},
@@ -331,6 +481,54 @@ async def handle_tool_call(name: str, arguments: Dict[str, Any], memory_store) -
                 end_date=arguments.get("end_date"),
             )
             # Don't log get_command_history calls to avoid noise
+            return [TextContent(type="text", text=json.dumps(result, indent=2, cls=DateTimeEncoder))]
+
+        elif name == "get_most_accessed_memories":
+            result = await memory_store.get_most_accessed_memories(limit=arguments.get("limit", 20))
+            _log_command(memory_store, name, arguments, f"retrieved {arguments.get('limit', 20)} most accessed", None, True)
+            return [TextContent(type="text", text=result)]
+
+        elif name == "get_least_accessed_memories":
+            result = await memory_store.get_least_accessed_memories(
+                limit=arguments.get("limit", 20),
+                min_age_days=arguments.get("min_age_days", 7)
+            )
+            _log_command(memory_store, name, arguments, f"retrieved {arguments.get('limit', 20)} least accessed", None, True)
+            return [TextContent(type="text", text=result)]
+
+        elif name == "list_categories":
+            result = await memory_store.list_categories(min_count=arguments.get("min_count", 1))
+            _log_command(memory_store, name, arguments, f"listed {len(result.get('categories', []))} categories", None, True)
+            return [TextContent(type="text", text=json.dumps(result, indent=2, cls=DateTimeEncoder))]
+
+        elif name == "list_tags":
+            result = await memory_store.list_tags(min_count=arguments.get("min_count", 1))
+            _log_command(memory_store, name, arguments, f"listed {len(result.get('tags', []))} tags", None, True)
+            return [TextContent(type="text", text=json.dumps(result, indent=2, cls=DateTimeEncoder))]
+
+        elif name == "get_session_memories":
+            result = await memory_store.get_session_memories(
+                session_id=arguments.get("session_id"),
+                date_range=arguments.get("date_range"),
+                task_context=arguments.get("task_context"),
+                limit=arguments.get("limit", 100)
+            )
+            _log_command(memory_store, name, arguments, f"retrieved {len(result)} session memories", None, True)
+            return [TextContent(type="text", text=json.dumps(result, indent=2, cls=DateTimeEncoder))]
+
+        elif name == "get_memory_timeline":
+            result = await memory_store.get_memory_timeline(
+                query=arguments.get("query"),
+                memory_id=arguments.get("memory_id"),
+                limit=arguments.get("limit", 10),
+                start_date=arguments.get("start_date"),
+                end_date=arguments.get("end_date"),
+                show_all_memories=arguments.get("show_all_memories", False),
+                include_diffs=arguments.get("include_diffs", True),
+                include_patterns=arguments.get("include_patterns", True),
+                include_semantic_relations=arguments.get("include_semantic_relations", False),
+            )
+            _log_command(memory_store, name, arguments, f"timeline: {result.get('total_events', 0)} events", None, True)
             return [TextContent(type="text", text=json.dumps(result, indent=2, cls=DateTimeEncoder))]
 
         elif name == "run_maintenance":
