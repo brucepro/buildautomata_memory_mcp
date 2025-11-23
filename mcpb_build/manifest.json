@@ -9,12 +9,12 @@
     "email": "sales@brucepro.net"
   },
   "license": "Custom",
-  "homepage": "https://github.com/brucepro/claudecode_playground",
+  "homepage": "https://github.com/brucepro/buildautomata_memory_mcp",
   "repository": {
     "type": "git",
-    "url": "https://github.com/brucepro/claudecode_playground"
+    "url": "https://github.com/brucepro/buildautomata_memory_mcp"
   },
-  "documentation": "https://github.com/brucepro/claudecode_playground/blob/main/memory_mcp/README.md",
+  "documentation": "https://github.com/brucepro/buildautomata_memory_mcp/blob/main/README.md",
   "icon": "icon.png",
   "screenshots": [
     "screenshots/memory_search.png",
