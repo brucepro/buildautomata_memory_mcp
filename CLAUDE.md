@@ -132,7 +132,6 @@ The server exposes 13 tools (buildautomata_memory_mcp.py:2321):
 - `store_intention` - Create intentions with deadlines and actions
 - `get_active_intentions` - List active/pending intentions by priority
 - `update_intention_status` - Manage intention lifecycle (pending/active/completed/cancelled)
-- `proactive_scan` - Manual scan for continuity/intentions/context
 
 ### Key Algorithms
 

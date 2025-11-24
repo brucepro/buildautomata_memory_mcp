@@ -20,7 +20,7 @@ BuildAutomata Memory is an MCP server that gives AI agents (like Claude) **persi
 
 - Python 3.10+
 - Claude Desktop (for MCP integration) OR any MCP-compatible client
-- Optional: Qdrant for enhanced semantic search
+
 
 ### Installation
 
@@ -176,25 +176,15 @@ Cursor AI → Accesses same memory database
 
 The Gumroad version includes:
 
-- ✅ **Pre-compiled Qdrant server** (Windows .exe, no Docker needed)
-- ✅ **One-click startup script** (start_qdrant.bat)
-- ✅ **Step-by-step setup guide** (instructions.txt)
-- ✅ **Commercial license** for business use
 - ✅ **Priority support** via email
-
-**Perfect for:**
-- Non-technical users who want easy setup
-- Windows users wanting the full-stack bundle
-- Commercial/business users needing licensing clarity
-- Anyone who values their time over DIY setup
+- ✅ **Project support** Help the project get funding.
 
 **This open-source version:**
 - ✅ Free for personal/educational/small business use (<$100k revenue)
 - ✅ Full source code access
-- ✅ DIY Qdrant setup (you install from qdrant.io)
 - ✅ Community support via GitHub issues
 
-Both versions use the **exact same core code** - you're just choosing between convenience (Gumroad) vs DIY (GitHub).
+Both versions use the **exact same core code** - you're just choosing between project support (Gumroad) vs DIY (GitHub).
 
 ## Configuration
 
@@ -222,6 +212,8 @@ Memories are stored at:
 ```
 <script_dir>/memory_repos/<username>_<agent_name>/memoryv012.db
 ```
+## Qdrant: 
+We are now using embedded qdrant. You can overide this setting by running your own server.
 
 ## Optional: Qdrant Setup
 
@@ -235,42 +227,8 @@ docker run -p 6333:6333 qdrant/qdrant
 ### Option 2: Manual Install
 Download from [Qdrant Releases](https://github.com/qdrant/qdrant/releases)
 
-### Option 3: Gumroad Bundle
-Includes pre-compiled Windows executable + startup script
-
-**Without Qdrant:** System still works with SQLite FTS5 full-text search (less semantic understanding)
-
-## Development
-
-### Running Tests
-```bash
-# Search test
-python interactive_memory.py search "test" --limit 5
-
-# Store test
-python interactive_memory.py store "Test memory" --category test
-
-# Stats
-python interactive_memory.py stats
-```
-
-### File Structure
-```
-buildautomata_memory_mcp_dev/
-├── buildautomata_memory_mcp.py      # MCP server
-├── interactive_memory.py             # CLI interface
-├── memory.bat / memory.sh            # Helper scripts
-├── CLAUDE.md                         # Architecture docs
-├── README_CLI.md                     # CLI documentation
-├── CLAUDE_CODE_INTEGRATION.md        # Integration guide
-└── README.md                         # This file
-```
 
 ## Troubleshooting
-
-### "Qdrant not available"
-- Normal if running without Qdrant - falls back to SQLite FTS5
-- To enable: Start Qdrant server and restart MCP server
 
 ### "Permission denied" on database
 - Check `memory_repos/` directory permissions
@@ -311,15 +269,6 @@ pip install --upgrade mcp qdrant-client sentence-transformers
 - Setup assistance
 - Custom configuration help
 
-## Roadmap
-
-- [ ] Memory relationship graphs
-- [ ] Batch import/export
-- [ ] Web UI for memory management
-- [ ] Multi-modal memory (images, audio)
-- [ ] Collaborative memory (multi-user)
-- [ ] Memory consolidation/summarization
-- [ ] Smart auto-tagging
 
 ## Contributing
 
@@ -350,7 +299,7 @@ Contributions welcome! Please:
 ---
 
 **Star this repo** ⭐ if you find it useful!
-**Consider the [Gumroad bundle](https://brucepro1.gumroad.com/l/zizjl)** if you want to support development and get the easy-install version.
+**Consider the [Gumroad bundle](https://brucepro1.gumroad.com/l/zizjl)** if you want to support development.
 
 - [Buy me a coffee](https://www.buymeacoffee.com/brucepro)
 - [Ko-fi](https://ko-fi.com/F1F7U45XV)
