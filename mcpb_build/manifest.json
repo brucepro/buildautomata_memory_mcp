@@ -17,9 +17,9 @@
   "documentation": "https://github.com/brucepro/buildautomata_memory_mcp/blob/main/README.md",
   "icon": "icon.png",
   "screenshots": [
-    "screenshots/memory_search.png",
-    "screenshots/graph_traversal.png",
-    "screenshots/timeline_view.png"
+    "screenshots/search.png",
+    "screenshots/memory_store.png",
+    "screenshots/search_save.png"
   ],
 
   "server": {
