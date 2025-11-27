@@ -378,7 +378,7 @@ class SQLiteStore:
         # Split into words and quote each separately for OR search
         # This allows "play autonomous exploration" to match memories containing any of those words
         words = query.strip().split()
-        escaped_words = [f'"{word.replace('"', '""')}"' for word in words]
+        escaped_words = [f'"{word.replace(chr(34), chr(34)+chr(34))}"' for word in words]
         return ' OR '.join(escaped_words)
 
     def _row_to_memory(self, row) -> Memory:
