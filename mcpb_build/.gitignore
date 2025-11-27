@@ -11,7 +11,7 @@ __pycache__/
 *.pyd
 
 # Extension packages
-*.mcpb
+
 
 # Manifest backups
 manifest*.bak
