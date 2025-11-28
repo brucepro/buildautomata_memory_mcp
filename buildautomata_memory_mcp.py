@@ -86,8 +86,6 @@ if not EMBEDDINGS_AVAILABLE:
     logger.warning("SentenceTransformers not available - using fallback embeddings")
 
 
-# LRUCache, Memory, Intention, and MemoryRelationship now imported from modules
-
 class MemoryStore:
     def __init__(self, username: str, agent_name: str, lazy_load: bool = False):
         self.username = username
@@ -105,14 +103,14 @@ class MemoryStore:
         self.config = {
             "qdrant_path": self.qdrant_path,
             "vector_size": 768,
-            "max_memories": int(os.getenv("MAX_MEMORIES", 10000)),
+            "max_memories": int(os.getenv("MAX_MEMORIES", 100000)),
             "cache_maxsize": int(os.getenv("CACHE_MAXSIZE", 1000)),
             "maintenance_interval_hours": int(os.getenv("MAINTENANCE_INTERVAL_HOURS", 24)),
             "qdrant_max_retries": int(os.getenv("QDRANT_MAX_RETRIES", 3)),
         }
 
         self.qdrant_client = None
-        self.encoder = None  # Kept for backward compatibility, but now managed by EmbeddingGenerator
+        self.encoder = None  
         self.db_conn = None
         self._qdrant_initialized = False
         self._encoder_initialized = False
@@ -141,7 +139,7 @@ class MemoryStore:
             error_log=self.error_log,
             lazy_load=lazy_load
         )
-        # Sync qdrant_client reference for backward compatibility
+        # Maintain qdrant_client reference for internal methods
         self.qdrant_client = self.qdrant_store.client
 
         # Initialize SQLite store (placeholder - will be initialized in initialize())
@@ -242,13 +240,9 @@ class MemoryStore:
         # Trigger lazy initialization if needed
         if hasattr(self.qdrant_store, '_ensure_initialized'):
             self.qdrant_store._ensure_initialized()
-        # Sync reference for backward compatibility
+        # Sync qdrant_client reference for internal use
         self.qdrant_client = self.qdrant_store.client
 
-    def _init_qdrant(self):
-        """Initialize Qdrant (delegated to QdrantStore - kept for compatibility)"""
-        # Sync reference for backward compatibility
-        self.qdrant_client = self.qdrant_store.client
 
     def _log_error(self, operation: str, error: Exception):
         """Log detailed error information"""
@@ -266,7 +260,7 @@ class MemoryStore:
     def generate_embedding(self, text: str) -> List[float]:
         """Generate embedding with caching - delegates to EmbeddingGenerator"""
         result = self.embedding_gen.generate_embedding(text)
-        # Sync encoder reference for backward compatibility (AFTER generation triggers init)
+        # Maintain encoder reference for internal use (after lazy init)
         self.encoder = self.embedding_gen.encoder
         return result
 
@@ -541,7 +535,6 @@ class MemoryStore:
         tags: Optional[List[str]] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        """Update an existing memory"""
         logger.info(f"Attempting to update memory: {memory_id}")
 
         existing = await self._get_memory_by_id(memory_id)
@@ -551,10 +544,8 @@ class MemoryStore:
 
         logger.info(f"Found existing memory: {memory_id}, updating fields")
 
-        # Store old hash before making changes
         old_hash = existing.content_hash()
 
-        # Apply updates
         if content is not None:
             existing.content = content
         if category is not None:
@@ -568,7 +559,6 @@ class MemoryStore:
 
         existing.updated_at = datetime.now()
 
-        # Pass old hash to store_memory for comparison
         result = await self.store_memory(existing, is_update=True, old_hash=old_hash)
 
         if result["success"]:
@@ -586,12 +576,10 @@ class MemoryStore:
         """Retrieve a memory by ID"""
         logger.debug(f"Retrieving memory by ID: {memory_id}")
 
-        # Check cache first
         if memory_id in self.memory_cache:
             logger.debug(f"Memory {memory_id} found in cache")
             return self.memory_cache[memory_id]
 
-        # Try SQLite
         if self.db_conn:
             try:
                 memory = await asyncio.to_thread(self._get_from_sqlite, memory_id)
@@ -614,7 +602,7 @@ class MemoryStore:
             )
             row = cursor.fetchone()
             if row:
-                return self._row_to_memory(row)
+                return Memory.from_row(row)
         return None
 
     async def search_memories(
@@ -634,7 +622,6 @@ class MemoryStore:
         """Search memories with version history automatically included"""
         all_results = []
 
-        # Vector search
         if self.qdrant_client:
             try:
                 vector_results = await self._search_vector(
@@ -647,11 +634,10 @@ class MemoryStore:
                 logger.error(f"Vector search failed: {e}")
                 self._log_error("search_vector", e)
 
-        # FTS search
         if self.db_conn:
             try:
                 fts_results = await asyncio.to_thread(
-                    self._search_fts, query, limit, category, min_importance,
+                    self.sqlite_store.search_fts, query, limit, category, min_importance,
                     created_after, created_before, updated_after, updated_before,
                     memory_type, session_id
                 )
@@ -660,7 +646,6 @@ class MemoryStore:
                 logger.error(f"FTS search failed: {e}")
                 self._log_error("search_fts", e)
 
-        # Deduplicate and rank
         seen = set()
         unique = []
         for mem in all_results:
@@ -669,32 +654,27 @@ class MemoryStore:
                 unique.append(mem)
 
         unique.sort(
-            key=lambda m: self._calculate_relevance(m, query) * m.current_importance(),
+            key=lambda m: SQLiteStore.calculate_relevance(m, query) * m.current_importance(),
             reverse=True,
         )
 
-        # Update access stats and build results with version history
         results = []
         for mem in unique[:limit]:
-            await asyncio.to_thread(self._update_access, mem.id)
+            await asyncio.to_thread(self.sqlite_store.update_access, mem.id)
 
-            # Get fresh stats from database (in case Qdrant is out of sync)
             version_count = await asyncio.to_thread(self._get_version_count, mem.id)
             mem.version_count = version_count
 
-            # Get fresh access stats from SQLite (Qdrant payload may be stale)
             access_count, last_accessed = await asyncio.to_thread(self._get_access_stats, mem.id)
             mem.access_count = access_count
             if last_accessed:
                 mem.last_accessed = datetime.fromisoformat(last_accessed) if isinstance(last_accessed, str) else last_accessed
 
-            # Get fresh related_memories from SQLite (source of truth)
             related_mems = await asyncio.to_thread(self._get_related_memories, mem.id)
             mem.related_memories = related_mems
 
-            mem_dict = self._memory_to_dict(mem)
+            mem_dict = mem.to_api_dict(enrich_related=self.graph_ops.enrich_related_memories)
             
-            # Always include version history for memories with updates
             if include_versions and version_count > 1:
                 version_history = await asyncio.to_thread(self._get_version_history_summary, mem.id)
                 if version_history:
@@ -762,10 +742,6 @@ class MemoryStore:
             logger.error(f"Failed to get related_memories for {memory_id}: {e}")
             return []
 
-    def _enrich_related_memories(self, related_ids: List[str]) -> List[Dict[str, Any]]:
-        """Enrich related memories (delegated to GraphOperations)"""
-        return self.graph_ops.enrich_related_memories(related_ids)
-
     def _get_version_history_summary(self, memory_id: str) -> Optional[Dict[str, Any]]:
         """Get concise version history summary for a memory with actual content from each version"""
         if not self.db_conn:
@@ -773,7 +749,6 @@ class MemoryStore:
         
         try:
             with self._db_lock:
-                # Get all versions with full content
                 cursor = self.db_conn.execute("""
                     SELECT 
                         version_number,
@@ -793,7 +768,6 @@ class MemoryStore:
                 if not versions or len(versions) <= 1:
                     return None
                 
-                # Build comprehensive summary with actual content
                 summary = {
                     "total_versions": len(versions),
                     "created": versions[0]["created_at"],
@@ -802,7 +776,6 @@ class MemoryStore:
                     "evolution": []
                 }
                 
-                # Show full evolution with actual content from each version
                 for v in versions:
                     version_info = {
                         "version": v["version_number"],
@@ -852,19 +825,16 @@ class MemoryStore:
                     FieldCondition(key="importance", range=Range(gte=min_importance))
                 )
 
-            # NEW: Memory type filtering
             if memory_type:
                 filter_conditions.append(
                     FieldCondition(key="memory_type", match={"value": memory_type})
                 )
 
-            # NEW: Session ID filtering
             if session_id:
                 filter_conditions.append(
                     FieldCondition(key="session_id", match={"value": session_id})
                 )
 
-            # FIX: Add date range filtering for Qdrant
             if created_after:
                 filter_conditions.append(
                     FieldCondition(key="created_at", range=DatetimeRange(gte=created_after))
@@ -915,148 +885,6 @@ class MemoryStore:
             self._log_error("vector_search", e)
             return []
 
-    def _sanitize_fts_query(self, query: str) -> str:
-        """Sanitize query (delegated to SQLiteStore)"""
-        return self.sqlite_store.sanitize_fts_query(query)
-
-    def _search_fts(
-        self, query: str, limit: int, category: Optional[str], min_importance: float,
-        created_after: Optional[str], created_before: Optional[str],
-        updated_after: Optional[str], updated_before: Optional[str],
-        memory_type: Optional[str] = None, session_id: Optional[str] = None
-    ) -> List[Memory]:
-        """Full-text search (delegated to SQLiteStore)"""
-        return self.sqlite_store.search_fts(
-            query, limit, category, min_importance,
-            created_after, created_before, updated_after, updated_before,
-            memory_type, session_id
-        )
-
-    def _row_to_memory(self, row) -> Memory:
-        """Convert SQLite row to Memory object"""
-        # Parse provenance and relationships if present
-        provenance = None
-        if "provenance" in row.keys() and row["provenance"]:
-            try:
-                provenance = json.loads(row["provenance"])
-            except:
-                provenance = None
-
-        relationships = []
-        if "relationships" in row.keys() and row["relationships"]:
-            try:
-                rel_dicts = json.loads(row["relationships"])
-                relationships = [MemoryRelationship(**r) for r in rel_dicts]
-            except:
-                relationships = []
-
-        related_memories = []
-        if "related_memories" in row.keys() and row["related_memories"]:
-            try:
-                related_memories = json.loads(row["related_memories"])
-            except:
-                related_memories = []
-
-        return Memory(
-            id=row["id"],
-            content=row["content"],
-            category=row["category"],
-            importance=row["importance"],
-            tags=json.loads(row["tags"]) if row["tags"] else [],
-            metadata=json.loads(row["metadata"]) if row["metadata"] else {},
-            created_at=row["created_at"],
-            updated_at=row["updated_at"],
-            access_count=row["access_count"],
-            last_accessed=row["last_accessed"],
-            valid_from=row["valid_from"] if "valid_from" in row.keys() else None,
-            valid_until=row["valid_until"] if "valid_until" in row.keys() else None,
-            decay_rate=row["decay_rate"],
-            version_count=row["version_count"] if "version_count" in row.keys() else 1,
-            memory_type=row["memory_type"] if "memory_type" in row.keys() else "episodic",
-            session_id=row["session_id"] if "session_id" in row.keys() else None,
-            task_context=row["task_context"] if "task_context" in row.keys() else None,
-            provenance=provenance,
-            relationships=relationships,
-            related_memories=related_memories,
-        )
-
-    def _calculate_relevance(self, memory: Memory, query: str) -> float:
-        """Calculate relevance score for ranking"""
-        score = 0.0
-        q_lower = query.lower()
-        c_lower = memory.content.lower()
-
-        if q_lower in c_lower:
-            score += 0.5
-
-        q_words = set(q_lower.split())
-        c_words = set(c_lower.split())
-        if q_words:
-            score += 0.3 * (len(q_words & c_words) / len(q_words))
-
-        m_tags = set(tag.lower() for tag in memory.tags)
-        if q_words & m_tags:
-            score += 0.2
-
-        return min(1.0, score)
-
-    def _memory_to_dict(self, memory: Memory) -> Dict:
-        """Convert Memory to dict for API response with statistics"""
-        days_since_access = 0
-        if memory.last_accessed:
-            days_since_access = (datetime.now() - memory.last_accessed).days
-
-        decay_factor = memory.decay_rate ** days_since_access if days_since_access > 0 else 1.0
-
-        # Enrich related_memories with previews for autonomous navigation
-        related_memories_enriched = []
-        if memory.related_memories:
-            related_memories_enriched = self._enrich_related_memories(memory.related_memories)
-
-        return {
-            "memory_id": memory.id,
-            "content": memory.content,
-            "category": memory.category,
-            "importance": memory.importance,
-            "current_importance": memory.current_importance(),
-            "tags": memory.tags,
-            "created_at": memory.created_at.isoformat(),
-            "updated_at": memory.updated_at.isoformat(),
-            "access_count": memory.access_count,
-            "last_accessed": memory.last_accessed.isoformat() if memory.last_accessed else None,
-            "days_since_access": days_since_access,
-            "decay_factor": round(decay_factor, 3),
-            "version_count": memory.version_count,
-            "related_memories": related_memories_enriched,
-        }
-
-    def _update_access(self, memory_id: str):
-        """Update access statistics (delegated to SQLiteStore)"""
-        self.sqlite_store.update_access(memory_id)
-
-    # === TIMELINE HELPER METHODS (delegated to TimelineAnalysis) ===
-
-    def _compute_text_diff(self, old_text: str, new_text: str) -> Dict[str, Any]:
-        """Compute text diff (delegated to TimelineAnalysis)"""
-        return self.timeline.compute_text_diff(old_text, new_text)
-
-    def _extract_memory_references(self, content: str, all_memory_ids: set) -> List[str]:
-        """Extract memory references (delegated to TimelineAnalysis)"""
-        return self.timeline.extract_memory_references(content, all_memory_ids)
-
-    def _detect_temporal_patterns(self, events: List[Dict]) -> Dict[str, Any]:
-        """Detect temporal patterns (delegated to TimelineAnalysis)"""
-        return self.timeline.detect_temporal_patterns(events)
-
-    def _get_memory_versions_detailed(
-        self,
-        mem_id: str,
-        all_memory_ids: set,
-        include_diffs: bool
-    ) -> List[Dict[str, Any]]:
-        """Get detailed version history (delegated to TimelineAnalysis)"""
-        return self.timeline.get_memory_versions_detailed(mem_id, all_memory_ids, include_diffs)
-
     async def _find_related_memories_semantic(
         self,
         memory_id: str,
@@ -1065,25 +893,22 @@ class MemoryStore:
     ) -> List[Dict[str, Any]]:
         """Find semantically related memories using full content search
 
-        Applies the Bitter Lesson: use learned embeddings (search) to discover
-        relationships, rather than hand-coded features.
         """
         try:
             # Search using full memory content as query
             related = await self.search_memories(
                 query=content,
-                limit=limit + 1,  # +1 because we'll filter out self
+                limit=limit + 1,
                 include_versions=False
             )
 
-            # Filter out the memory itself
             filtered = [
                 {
                     "memory_id": mem["memory_id"],
                     "content_preview": mem["content"][:200] + "..." if len(mem["content"]) > 200 else mem["content"],
                     "category": mem.get("category"),
                     "importance": mem.get("importance"),
-                    "similarity": "semantic"  # Marker that this is semantic, not explicit
+                    "similarity": "semantic"
                 }
                 for mem in related
                 if mem["memory_id"] != memory_id
@@ -1095,15 +920,6 @@ class MemoryStore:
             logger.error(f"Semantic related search failed for {memory_id}: {e}")
             return []
 
-    def _build_relationship_graph(self, events: List[Dict]) -> Dict[str, Any]:
-        """Build relationship graph (delegated to TimelineAnalysis)"""
-        return self.timeline.build_relationship_graph(events)
-
-    def _generate_narrative_summary(self, events: List[Dict], patterns: Dict) -> str:
-        """Generate narrative summary (delegated to TimelineAnalysis)"""
-        return self.timeline.generate_narrative_summary(events, patterns)
-
-    # === INTENTION MANAGEMENT (Agency Bridge Pattern) ===
 
     async def store_intention(
         self,
@@ -1195,7 +1011,7 @@ class MemoryStore:
                 params.append(limit)
 
                 cursor = self.db_conn.execute(sql, params)
-                memories = [self._row_to_memory(row) for row in cursor.fetchall()]
+                memories = [Memory.from_row(row) for row in cursor.fetchall()]
 
                 # Convert to dicts - fast SQLite-only operation
                 result = [mem.to_dict() for mem in memories]
@@ -1234,7 +1050,6 @@ class MemoryStore:
             return {"success": False, "error": "Need at least 2 memories to consolidate"}
 
         try:
-            # Retrieve source memories
             source_memories = []
             for mem_id in memory_ids:
                 mem = await self.get_memory_by_id(mem_id)
@@ -1313,17 +1128,12 @@ class MemoryStore:
     async def get_most_accessed_memories(self, limit: int = 20) -> str:
         """Get most accessed memories with tag cloud
 
-        Returns behavioral truth - what memories are actually relied upon
-        based on access_count rather than declared importance.
-
-        Implements Saint Bernard pattern: importance from usage, not declaration.
         """
         if not self.db_conn:
             return json.dumps({"error": "Database not available"})
 
         try:
             with self._db_lock:
-                # Get most accessed memories
                 cursor = self.db_conn.execute("""
                     SELECT id, content, category, importance, access_count,
                            last_accessed, tags
@@ -1346,17 +1156,14 @@ class MemoryStore:
                     }
                     memories.append(memory)
 
-                    # Collect tags for cloud
-                    if row[6]:  # tags column
+                    if row[6]:
                         tags = json.loads(row[6])
                         all_tags.extend(tags)
 
-                # Build tag cloud - count frequency
                 tag_counts = {}
                 for tag in all_tags:
                     tag_counts[tag] = tag_counts.get(tag, 0) + 1
 
-                # Sort by frequency
                 tag_cloud = [
                     {"tag": tag, "count": count}
                     for tag, count in sorted(tag_counts.items(), key=lambda x: x[1], reverse=True)
@@ -1377,23 +1184,14 @@ class MemoryStore:
             return json.dumps({"error": str(e)})
 
     async def get_least_accessed_memories(self, limit: int = 20, min_age_days: int = 7) -> str:
-        """Get least accessed memories - reveals dead weight and buried treasure
+        """Get least accessed memories
 
-        Returns memories with lowest access_count, excluding very recent ones
-        (they haven't had time to be accessed yet).
-
-        What this reveals:
-        - Dead weight: High importance but never referenced (performed profundity)
-        - Buried treasure: Good content with bad metadata (needs better tags)
-        - Temporal artifacts: Once important, now obsolete
-        - Storage habits: Are you storing too much trivial content?
         """
         if not self.db_conn:
             return json.dumps({"error": "Database not available"})
 
         try:
             with self._db_lock:
-                # Get least accessed memories, excluding very recent ones
                 cursor = self.db_conn.execute("""
                     SELECT id, content, category, importance, access_count,
                            last_accessed, tags, created_at
@@ -1412,7 +1210,6 @@ class MemoryStore:
                     if access_count == 0:
                         zero_access_count += 1
 
-                    # Handle created_at - might be datetime object or string
                     created_at = row[7]
                     if isinstance(created_at, str):
                         created_dt = datetime.fromisoformat(created_at)
@@ -1431,17 +1228,14 @@ class MemoryStore:
                     }
                     memories.append(memory)
 
-                    # Collect tags for cloud
-                    if row[6]:  # tags column
+                    if row[6]:
                         tags = json.loads(row[6])
                         all_tags.extend(tags)
 
-                # Build tag cloud - count frequency
                 tag_counts = {}
                 for tag in all_tags:
                     tag_counts[tag] = tag_counts.get(tag, 0) + 1
 
-                # Sort by frequency
                 tag_cloud = [
                     {"tag": tag, "count": count}
                     for tag, count in sorted(tag_counts.items(), key=lambda x: x[1], reverse=True)
@@ -1550,7 +1344,6 @@ class MemoryStore:
             return []
 
         try:
-            # Get all memories with needed fields
             with self._db_lock:
                 cursor = self.db_conn.execute("""
                     SELECT id, content, category, importance, tags,
@@ -1572,16 +1365,13 @@ class MemoryStore:
                     }
                     memories.append(memory)
 
-            # Score all memories
             scored_memories = []
             for mem in memories:
                 score = self.calculate_working_set_score(mem)
                 scored_memories.append((score, mem))
 
-            # Sort by score (descending)
             scored_memories.sort(key=lambda x: x[0], reverse=True)
 
-            # Select top N and include scores
             working_set = []
             for score, mem in scored_memories[:target_size]:
                 mem['working_set_score'] = round(score, 2)
@@ -1604,7 +1394,6 @@ class MemoryStore:
         
         try:
             with self._db_lock:
-                # Count current memories
                 cursor = self.db_conn.execute("SELECT COUNT(*) FROM memories")
                 current_count = cursor.fetchone()[0]
                 
@@ -1614,10 +1403,8 @@ class MemoryStore:
                         "reason": f"Current count ({current_count}) within limit ({max_memories})"
                     }
                 
-                # Calculate how many to prune
                 to_prune = current_count - max_memories
                 
-                # Find least valuable memories (low importance × low access × old)
                 cursor = self.db_conn.execute("""
                     SELECT id, content, importance, access_count, 
                            julianday('now') - julianday(last_accessed) as days_since_access
@@ -1643,7 +1430,6 @@ class MemoryStore:
                         ]
                     }
                 
-                # Actually delete
                 pruned_ids = [row["id"] for row in candidates]
                 self.db_conn.execute(f"""
                     DELETE FROM memories WHERE id IN ({','.join('?' * len(pruned_ids))})
@@ -1655,7 +1441,6 @@ class MemoryStore:
                 
                 self.db_conn.commit()
                 
-                # Also remove from Qdrant
                 if self.qdrant_client:
                     try:
                         await asyncio.to_thread(
@@ -1666,7 +1451,6 @@ class MemoryStore:
                     except Exception as e:
                         logger.warning(f"Failed to prune from Qdrant: {e}")
                 
-                # Clear from cache
                 for mem_id in pruned_ids:
                     self.memory_cache.pop(mem_id, None)
                 
@@ -1682,13 +1466,12 @@ class MemoryStore:
             return {"error": str(e)}
 
     async def maintenance(self) -> Dict[str, Any]:
-        """FIX: Periodic maintenance tasks"""
+        """Periodic maintenance tasks"""
         results = {
             "timestamp": datetime.now().isoformat(),
             "tasks": {}
         }
         
-        # Check if maintenance needed
         if self.last_maintenance:
             hours_since = (datetime.now() - self.last_maintenance).total_seconds() / 3600
             if hours_since < self.config["maintenance_interval_hours"]:
@@ -1697,7 +1480,6 @@ class MemoryStore:
                     "reason": f"Last maintenance {hours_since:.1f}h ago, interval is {self.config['maintenance_interval_hours']}h"
                 }
         
-        # VACUUM and ANALYZE
         if self.db_conn:
             try:
                 await asyncio.to_thread(self.db_conn.execute, "VACUUM")
@@ -1713,18 +1495,14 @@ class MemoryStore:
                 logger.error(f"ANALYZE failed: {e}")
                 results["tasks"]["analyze"] = f"failed: {str(e)}"
         
-        # Prune if needed
         prune_result = await self.prune_old_memories()
         results["tasks"]["prune"] = prune_result
         
-        # Clear old errors
         if len(self.error_log) > 50:
             removed = len(self.error_log) - 50
             self.error_log = self.error_log[-50:]
             results["tasks"]["error_log_cleanup"] = f"removed {removed} old errors"
 
-        # NOTE: Embedding repair removed from maintenance (too slow: 10+ min for 1000+ memories)
-        # Use standalone repair_embeddings.py script if needed
 
         self.last_maintenance = datetime.now()
         return results
@@ -1751,11 +1529,9 @@ class MemoryStore:
         if not self.qdrant_client:
             return {"skipped": True, "reason": "Qdrant not available"}
 
-        # Import when needed (after qdrant initialization)
         from qdrant_client.models import PointStruct
 
         try:
-            # Get all memory IDs from SQLite
             with self._db_lock:
                 cursor = self.db_conn.execute("SELECT id, content FROM memories")
                 all_memories = cursor.fetchall()
@@ -1771,7 +1547,6 @@ class MemoryStore:
                 memory_id = row["id"]
                 content = row["content"]
 
-                # Check if vector exists in Qdrant
                 try:
                     points = await asyncio.to_thread(
                         self.qdrant_client.retrieve,
@@ -1782,19 +1557,13 @@ class MemoryStore:
                     )
 
                     if not points:
-                        # Missing vector - regenerate it
                         missing_count += 1
-
-                        # Generate embedding
                         embedding = await asyncio.to_thread(self.generate_embedding, content)
-
-                        # Get full memory data for payload
                         memory_result = await self.get_memory_by_id(memory_id)
                         if "error" in memory_result:
                             failed_ids.append(memory_id)
                             continue
 
-                        # Create point and upsert
                         point = PointStruct(
                             id=memory_id,
                             vector=embedding,
@@ -1878,7 +1647,6 @@ class MemoryStore:
                 if not row:
                     return {"error": f"Memory not found: {memory_id}"}
 
-                # Build memory object
                 memory_dict = {
                     "memory_id": row["id"],
                     "content": row["content"],
@@ -1893,7 +1661,6 @@ class MemoryStore:
                     "related_memories": json.loads(row["related_memories"]) if row["related_memories"] else [],
                 }
 
-                # Get version count
                 cursor = self.db_conn.execute(
                     "SELECT COUNT(*) FROM memory_versions WHERE memory_id = ?",
                     (memory_id,)
@@ -1901,7 +1668,6 @@ class MemoryStore:
                 version_count = cursor.fetchone()[0]
                 memory_dict["version_count"] = version_count
 
-                # Get latest version info
                 cursor = self.db_conn.execute(
                     """
                     SELECT version_number, change_type, change_description
@@ -1918,7 +1684,6 @@ class MemoryStore:
                     memory_dict["last_change_type"] = latest_version["change_type"]
                     memory_dict["last_change_description"] = latest_version["change_description"]
 
-                # Expand related memories with full content if requested
                 if expand_related and memory_dict["related_memories"]:
                     expanded = []
                     visited = {memory_id}  # Prevent cycles
@@ -1928,7 +1693,6 @@ class MemoryStore:
                             continue
                         visited.add(related_id)
 
-                        # Recursively expand (max_depth controls how deep)
                         if max_depth > 1:
                             related_mem = await self.get_memory_by_id(related_id, expand_related=True, max_depth=max_depth-1)
                         else:
@@ -2012,21 +1776,18 @@ class MemoryStore:
             with self._db_lock:
                 cursor = self.db_conn.execute("SELECT tags FROM memories WHERE tags IS NOT NULL")
 
-                # Aggregate all tags
                 tag_counts = {}
                 for row in cursor.fetchall():
                     tags = json.loads(row["tags"]) if row["tags"] else []
                     for tag in tags:
                         tag_counts[tag] = tag_counts.get(tag, 0) + 1
 
-                # Filter by min_count and sort
                 filtered_tags = {
                     tag: count
                     for tag, count in tag_counts.items()
                     if count >= min_count
                 }
 
-                # Sort by count descending, then alphabetically
                 sorted_tags = dict(
                     sorted(
                         filtered_tags.items(),
@@ -2068,7 +1829,6 @@ class MemoryStore:
             include_semantic_relations: If True (default), find semantically related memories
                                         to expose memory network. Expensive but valuable for AI context.
         """
-        # DEBUG: Log types of date parameters
         if start_date is not None:
             logger.info(f"[TIMELINE DEBUG] start_date type: {type(start_date)}, value: {start_date}")
         if end_date is not None:
@@ -2081,12 +1841,10 @@ class MemoryStore:
             import time
             timeline_start = time.perf_counter()
 
-            # Collect all events chronologically
             all_events = []
             target_memories = []
 
             if show_all_memories:
-                # Get ALL memories for full timeline (cap at 100 to prevent explosion)
                 limit_for_all = min(limit, 100) if limit else 100
                 logger.info(f"[TIMELINE] show_all_memories requested, limiting to {limit_for_all}")
                 with self._db_lock:
@@ -2116,16 +1874,14 @@ class MemoryStore:
             if not target_memories:
                 return {"error": "No memories found"}
 
-            # Get all memory IDs for cross-reference detection
             with self._db_lock:
                 cursor = self.db_conn.execute("SELECT id FROM memories")
                 all_memory_ids = {row[0] for row in cursor.fetchall()}
 
-            # Collect all version events
             step_start = time.perf_counter()
             for mem_id in target_memories:
                 versions = await asyncio.to_thread(
-                    self._get_memory_versions_detailed,
+                    self.timeline.get_memory_versions_detailed,
                     mem_id,
                     all_memory_ids,
                     include_diffs
@@ -2136,13 +1892,10 @@ class MemoryStore:
             if not all_events:
                 return {"error": "No version history found"}
 
-            # Sort chronologically
             all_events.sort(key=lambda e: e['timestamp'])
 
-            # Enrich with semantically related memories (EXPENSIVE - only if requested)
             if include_semantic_relations:
                 step_start = time.perf_counter()
-                # Group events by memory_id to avoid duplicate searches
                 unique_memories = {}
                 for event in all_events:
                     mem_id = event["memory_id"]
@@ -2150,14 +1903,12 @@ class MemoryStore:
                         unique_memories[mem_id] = event["content"]
 
                 logger.info(f"[TIMELINE] Finding semantic relations for {len(unique_memories)} unique memories...")
-                # Find related memories for each unique memory
                 related_map = {}
                 for mem_id, content in unique_memories.items():
                     related = await self._find_related_memories_semantic(mem_id, content, limit=5)
                     if related:
                         related_map[mem_id] = related
 
-                # Add related memories to events
                 for event in all_events:
                     mem_id = event["memory_id"]
                     if mem_id in related_map:
@@ -2167,30 +1918,25 @@ class MemoryStore:
             else:
                 logger.info("[TIMELINE] Skipping semantic relations (not requested)")
 
-            # Detect patterns if requested
             patterns = {}
             if include_patterns:
                 step_start = time.perf_counter()
-                patterns = self._detect_temporal_patterns(all_events)
+                patterns = self.timeline.detect_temporal_patterns(all_events)
                 logger.info(f"[TIMELINE] Patterns detected in {(time.perf_counter() - step_start)*1000:.2f}ms")
 
-            # Build memory relationship graph (explicit UUID references)
             step_start = time.perf_counter()
-            memory_relationships = self._build_relationship_graph(all_events)
+            memory_relationships = self.timeline.build_relationship_graph(all_events)
             logger.info(f"[TIMELINE] Relationship graph built in {(time.perf_counter() - step_start)*1000:.2f}ms")
 
-            # Apply date filtering if specified
             if start_date or end_date:
                 filtered_events = []
                 for event in all_events:
                     event_dt = datetime.fromisoformat(event['timestamp'])
                     if start_date:
-                        # Ensure start_date is a string
                         start_dt = datetime.fromisoformat(start_date) if isinstance(start_date, str) else start_date
                         if event_dt < start_dt:
                             continue
                     if end_date:
-                        # Ensure end_date is a string
                         end_dt = datetime.fromisoformat(end_date) if isinstance(end_date, str) else end_date
                         if event_dt > end_dt:
                             continue
@@ -2207,7 +1953,7 @@ class MemoryStore:
                 "temporal_patterns": patterns,
                 "memory_relationships": memory_relationships,
                 "events": all_events,
-                "narrative_arc": self._generate_narrative_summary(all_events, patterns),
+                "narrative_arc": self.timeline.generate_narrative_summary(all_events, patterns),
                 "performance_ms": round(total_time, 2)
             }
 

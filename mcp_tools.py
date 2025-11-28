@@ -174,7 +174,7 @@ def get_tool_definitions() -> List[Tool]:
         ),
         Tool(
             name="get_command_history",
-            description="Get history of MCP tool calls for audit trail and session reconstruction",
+            description="Shows what you've already explored, stored, and searched. Each entry includes: timestamp, tool_name, full arguments (search queries, content stored), result_summary, memory_id, success flag. Use to: (1) avoid duplicate searches, (2) find when you stored specific topics, (3) see research patterns (search→store→synthesize), (4) reconstruct session flow after breaks, (5) verify you cited sources before claims. This is your cognitive breadcrumb trail.",
             inputSchema={
                 "type": "object",
                 "properties": {

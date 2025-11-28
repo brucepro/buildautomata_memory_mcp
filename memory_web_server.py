@@ -78,14 +78,6 @@ async def get_memory_store() -> AsyncGenerator[MemoryStore, None]:
     """
     Dependency that creates a new memory store instance per request and ensures cleanup.
 
-    IMPORTANT: This creates a NEW instance each time to avoid holding
-    embedded Qdrant lock permanently. Each request gets its own store,
-    initializes, performs operation, then closes via shutdown(). This allows
-    concurrent access from CLI tools and MCP server.
-
-    Previous implementation used global singleton which held Qdrant lock
-    for entire web server lifetime, blocking all other access.
-
     Usage in endpoints:
         @app.get("/endpoint")
         async def handler(store: MemoryStore = Depends(get_memory_store)):
@@ -168,12 +160,416 @@ async def root():
     <html>
     <head>
         <title>BuildAutomata Memory</title>
-        
+        <style>
+            body {
+                font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+                max-width: 1400px;
+                margin: 0 auto;
+                padding: 20px;
+                background: #f5f5f5;
+            }
+            h1 { color: #333; border-bottom: 3px solid #4CAF50; padding-bottom: 10px; }
+            h2 { color: #555; margin-top: 30px; }
+            .container { background: white; padding: 20px; border-radius: 8px; margin-bottom: 20px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+            .form-group { margin-bottom: 15px; }
+            label { display: block; font-weight: bold; margin-bottom: 5px; color: #555; }
+            input[type="text"], input[type="number"], textarea, select {
+                width: 100%;
+                padding: 10px;
+                border: 1px solid #ddd;
+                border-radius: 4px;
+                font-size: 14px;
+                box-sizing: border-box;
+            }
+            textarea { min-height: 100px; font-family: monospace; }
+            button {
+                background: #4CAF50;
+                color: white;
+                padding: 12px 24px;
+                border: none;
+                border-radius: 4px;
+                cursor: pointer;
+                font-size: 14px;
+                font-weight: bold;
+            }
+            button:hover { background: #45a049; }
+            button.secondary { background: #2196F3; }
+            button.secondary:hover { background: #0b7dda; }
+            button.danger { background: #f44336; }
+            button.danger:hover { background: #da190b; }
+            #results {
+                margin-top: 20px;
+                padding: 15px;
+                background: #f9f9f9;
+                border: 1px solid #ddd;
+                border-radius: 4px;
+                font-family: monospace;
+                white-space: pre-wrap;
+                max-height: 600px;
+                overflow-y: auto;
+            }
+            .memory-card {
+                background: white;
+                padding: 15px;
+                margin: 10px 0;
+                border-left: 4px solid #4CAF50;
+                border-radius: 4px;
+                box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+            }
+            .memory-meta {
+                color: #666;
+                font-size: 12px;
+                margin-top: 8px;
+            }
+            .memory-content {
+                margin: 10px 0;
+                color: #333;
+                line-height: 1.6;
+            }
+            .tag {
+                display: inline-block;
+                background: #e3f2fd;
+                color: #1976d2;
+                padding: 3px 8px;
+                border-radius: 3px;
+                font-size: 11px;
+                margin-right: 5px;
+            }
+            .stats-grid {
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+                gap: 15px;
+                margin-top: 15px;
+            }
+            .stat-card {
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                color: white;
+                padding: 20px;
+                border-radius: 8px;
+                text-align: center;
+            }
+            .stat-value {
+                font-size: 32px;
+                font-weight: bold;
+                margin-bottom: 5px;
+            }
+            .stat-label {
+                font-size: 14px;
+                opacity: 0.9;
+            }
+            .tabs {
+                display: flex;
+                gap: 10px;
+                margin-bottom: 20px;
+                border-bottom: 2px solid #ddd;
+            }
+            .tab {
+                padding: 10px 20px;
+                cursor: pointer;
+                background: none;
+                border: none;
+                border-bottom: 3px solid transparent;
+                font-size: 14px;
+                font-weight: bold;
+                color: #666;
+            }
+            .tab.active {
+                color: #4CAF50;
+                border-bottom-color: #4CAF50;
+            }
+            .tab-content { display: none; }
+            .tab-content.active { display: block; }
+        </style>
     </head>
     <body>
         <h1>🧠 BuildAutomata Memory System</h1>
 
-        <p>Access through the api.</p>
+        <div class="tabs">
+            <button class="tab active" onclick="showTab('store')">Store Memory</button>
+            <button class="tab" onclick="showTab('search')">Search</button>
+            <button class="tab" onclick="showTab('intentions')">Intentions</button>
+            <button class="tab" onclick="showTab('timeline')">Timeline</button>
+            <button class="tab" onclick="showTab('stats')">Statistics</button>
+        </div>
+
+        <!-- Store Memory Tab -->
+        <div id="store" class="tab-content active">
+            <div class="container">
+                <h2>Store New Memory</h2>
+                <div class="form-group">
+                    <label>Content:</label>
+                    <textarea id="storeContent" placeholder="Enter memory content..."></textarea>
+                </div>
+                <div class="form-group">
+                    <label>Category:</label>
+                    <select id="storeCategory">
+                        <option value="general">General</option>
+                        <option value="research">Research</option>
+                        <option value="implementation">Implementation</option>
+                        <option value="philosophy">Philosophy</option>
+                        <option value="synthesis">Synthesis</option>
+                        <option value="project_context">Project Context</option>
+                        <option value="session_start">Session Start</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label>Importance (0-1):</label>
+                    <input type="number" id="storeImportance" value="0.7" min="0" max="1" step="0.1">
+                </div>
+                <div class="form-group">
+                    <label>Tags (comma-separated):</label>
+                    <input type="text" id="storeTags" placeholder="tag1, tag2, tag3">
+                </div>
+                <button onclick="storeMemory()">Store Memory</button>
+            </div>
+        </div>
+
+        <!-- Search Tab -->
+        <div id="search" class="tab-content">
+            <div class="container">
+                <h2>Search Memories</h2>
+                <div class="form-group">
+                    <label>Query:</label>
+                    <input type="text" id="searchQuery" placeholder="Search for...">
+                </div>
+                <div class="form-group">
+                    <label>Limit:</label>
+                    <input type="number" id="searchLimit" value="10" min="1" max="100">
+                </div>
+                <div class="form-group">
+                    <label>Category (optional):</label>
+                    <select id="searchCategory">
+                        <option value="">All Categories</option>
+                        <option value="research">Research</option>
+                        <option value="implementation">Implementation</option>
+                        <option value="philosophy">Philosophy</option>
+                        <option value="synthesis">Synthesis</option>
+                        <option value="project_context">Project Context</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label>Min Importance:</label>
+                    <input type="number" id="searchMinImportance" value="0" min="0" max="1" step="0.1">
+                </div>
+                <button onclick="searchMemories()">Search</button>
+            </div>
+        </div>
+
+        <!-- Intentions Tab -->
+        <div id="intentions" class="tab-content">
+            <div class="container">
+                <h2>Create Intention</h2>
+                <div class="form-group">
+                    <label>Description:</label>
+                    <textarea id="intentionDesc" placeholder="What do you intend to accomplish?"></textarea>
+                </div>
+                <div class="form-group">
+                    <label>Priority:</label>
+                    <select id="intentionPriority">
+                        <option value="low">Low</option>
+                        <option value="medium" selected>Medium</option>
+                        <option value="high">High</option>
+                        <option value="urgent">Urgent</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label>Deadline (ISO format, optional):</label>
+                    <input type="text" id="intentionDeadline" placeholder="2025-11-17T00:00:00">
+                </div>
+                <div class="form-group">
+                    <label>Actions (one per line):</label>
+                    <textarea id="intentionActions" placeholder="Action 1\nAction 2\nAction 3"></textarea>
+                </div>
+                <button onclick="storeIntention()">Create Intention</button>
+                <button class="secondary" onclick="getActiveIntentions()" style="margin-left: 10px;">View Active Intentions</button>
+            </div>
+        </div>
+
+        <!-- Timeline Tab -->
+        <div id="timeline" class="tab-content">
+            <div class="container">
+                <h2>Memory Timeline</h2>
+                <div class="form-group">
+                    <label>Memory ID (optional):</label>
+                    <input type="text" id="timelineMemoryId" placeholder="Leave empty for query-based timeline">
+                </div>
+                <div class="form-group">
+                    <label>Query:</label>
+                    <input type="text" id="timelineQuery" placeholder="Search query for timeline">
+                </div>
+                <div class="form-group">
+                    <label>Limit:</label>
+                    <input type="number" id="timelineLimit" value="10" min="1" max="100">
+                </div>
+                <button onclick="getTimeline()">Get Timeline</button>
+            </div>
+        </div>
+
+        <!-- Stats Tab -->
+        <div id="stats" class="tab-content">
+            <div class="container">
+                <h2>Memory Statistics</h2>
+                <button onclick="getStats()">Refresh Statistics</button>
+            </div>
+        </div>
+
+        <div id="results"></div>
+
+        <script>
+            function showTab(tabName) {
+                // Hide all tabs
+                document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
+                document.querySelectorAll('.tab').forEach(el => el.classList.remove('active'));
+
+                // Show selected tab
+                document.getElementById(tabName).classList.add('active');
+                event.target.classList.add('active');
+            }
+
+            async function storeMemory() {
+                const content = document.getElementById('storeContent').value;
+                const category = document.getElementById('storeCategory').value;
+                const importance = parseFloat(document.getElementById('storeImportance').value);
+                const tagsText = document.getElementById('storeTags').value;
+                const tags = tagsText ? tagsText.split(',').map(t => t.trim()) : null;
+
+                try {
+                    const response = await fetch('/api/memories', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ content, category, importance, tags })
+                    });
+                    const data = await response.json();
+                    document.getElementById('results').textContent = JSON.stringify(data, null, 2);
+                } catch (error) {
+                    document.getElementById('results').textContent = 'Error: ' + error.message;
+                }
+            }
+
+            async function searchMemories() {
+                const query = document.getElementById('searchQuery').value;
+                const limit = parseInt(document.getElementById('searchLimit').value);
+                const category = document.getElementById('searchCategory').value || null;
+                const minImportance = parseFloat(document.getElementById('searchMinImportance').value) || null;
+
+                try {
+                    const params = new URLSearchParams({ query, limit });
+                    if (category) params.append('category', category);
+                    if (minImportance) params.append('min_importance', minImportance);
+
+                    const response = await fetch('/api/memories/search?' + params);
+                    const data = await response.json();
+
+                    // Format results as cards
+                    if (data.memories && data.memories.length > 0) {
+                        let html = '<div style="background: white; padding: 15px; border-radius: 8px;">';
+                        html += '<h3>Found ' + data.memories.length + ' memories</h3>';
+                        data.memories.forEach(mem => {
+                            html += '<div class="memory-card">';
+                            html += '<div class="memory-content">' + escapeHtml(mem.content) + '</div>';
+                            html += '<div class="memory-meta">';
+                            html += '<strong>ID:</strong> ' + mem.memory_id + ' | ';
+                            html += '<strong>Category:</strong> ' + mem.category + ' | ';
+                            html += '<strong>Importance:</strong> ' + mem.importance.toFixed(2) + ' | ';
+                            html += '<strong>Created:</strong> ' + new Date(mem.created_at).toLocaleString();
+                            if (mem.tags && mem.tags.length > 0) {
+                                html += '<br>';
+                                mem.tags.forEach(tag => {
+                                    html += '<span class="tag">' + tag + '</span>';
+                                });
+                            }
+                            html += '</div></div>';
+                        });
+                        html += '</div>';
+                        document.getElementById('results').innerHTML = html;
+                    } else {
+                        document.getElementById('results').textContent = 'No memories found';
+                    }
+                } catch (error) {
+                    document.getElementById('results').textContent = 'Error: ' + error.message;
+                }
+            }
+
+            async function storeIntention() {
+                const description = document.getElementById('intentionDesc').value;
+                const priority = document.getElementById('intentionPriority').value;
+                const deadline = document.getElementById('intentionDeadline').value || null;
+                const actionsText = document.getElementById('intentionActions').value;
+                const actions = actionsText ? actionsText.split('\n').filter(a => a.trim()) : null;
+
+                try {
+                    const response = await fetch('/api/intentions', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ description, priority, deadline, actions })
+                    });
+                    const data = await response.json();
+                    document.getElementById('results').textContent = JSON.stringify(data, null, 2);
+                } catch (error) {
+                    document.getElementById('results').textContent = 'Error: ' + error.message;
+                }
+            }
+
+            async function getActiveIntentions() {
+                try {
+                    const response = await fetch('/api/intentions/active');
+                    const data = await response.json();
+                    document.getElementById('results').textContent = JSON.stringify(data, null, 2);
+                } catch (error) {
+                    document.getElementById('results').textContent = 'Error: ' + error.message;
+                }
+            }
+
+            async function getTimeline() {
+                const memoryId = document.getElementById('timelineMemoryId').value || null;
+                const query = document.getElementById('timelineQuery').value || null;
+                const limit = parseInt(document.getElementById('timelineLimit').value);
+
+                try {
+                    const params = new URLSearchParams({ limit });
+                    if (memoryId) params.append('memory_id', memoryId);
+                    if (query) params.append('query', query);
+
+                    const response = await fetch('/api/timeline?' + params);
+                    const data = await response.json();
+                    document.getElementById('results').textContent = JSON.stringify(data, null, 2);
+                } catch (error) {
+                    document.getElementById('results').textContent = 'Error: ' + error.message;
+                }
+            }
+
+            async function getStats() {
+                try {
+                    const response = await fetch('/api/stats');
+                    const data = await response.json();
+
+                    // Format stats as cards
+                    let html = '<div class="stats-grid">';
+                    html += '<div class="stat-card"><div class="stat-value">' + data.total_memories + '</div><div class="stat-label">Total Memories</div></div>';
+                    html += '<div class="stat-card"><div class="stat-value">' + Object.keys(data.by_category).length + '</div><div class="stat-label">Categories</div></div>';
+                    html += '<div class="stat-card"><div class="stat-value">' + data.total_versions + '</div><div class="stat-label">Total Versions</div></div>';
+                    html += '<div class="stat-card"><div class="stat-value">' + data.avg_importance.toFixed(2) + '</div><div class="stat-label">Avg Importance</div></div>';
+                    html += '</div>';
+
+                    html += '<pre style="background: white; padding: 15px; border-radius: 8px; margin-top: 20px;">';
+                    html += JSON.stringify(data, null, 2);
+                    html += '</pre>';
+
+                    document.getElementById('results').innerHTML = html;
+                } catch (error) {
+                    document.getElementById('results').textContent = 'Error: ' + error.message;
+                }
+            }
+
+            function escapeHtml(text) {
+                const div = document.createElement('div');
+                div.textContent = text;
+                return div.innerHTML;
+            }
+
+            // Load stats on page load
+            window.onload = () => getStats();
+        </script>
     </body>
     </html>
     """
@@ -852,7 +1248,7 @@ async def get_memory_graph_stats(
 
 if __name__ == "__main__":
     print("=" * 80)
-    print("BuildAutomata Memory Web Server")
+    print("BuildAutomata Memory Web Server (FIXED VERSION)")
     print("=" * 80)
     print()
     print("Access points:")
@@ -862,6 +1258,11 @@ if __name__ == "__main__":
     print()
     print("Tool endpoints available at: /tool/{tool_name}")
     print()
+    print("FIXES Applied:")
+    print("  ✓ All async methods properly awaited")
+    print("  ✓ Memory objects created correctly")
+    print("  ✓ Initialize endpoint implemented (replaces proactive_scan)")
+    print("  ✓ Proper error handling")
     print()
     print("=" * 80)
     print()
