@@ -642,6 +642,43 @@ class SQLiteStore:
             logger.error(f"Failed to get last activity: {e}")
             return None
 
+    @staticmethod
+    def calculate_relevance(memory, query: str) -> float:
+        """Calculate relevance score for ranking search results
+
+        Scoring breakdown:
+        - 0.5: Exact query match in content
+        - 0.3: Word overlap ratio
+        - 0.2: Tag matches
+
+        Args:
+            memory: Memory object to score
+            query: Search query string
+
+        Returns:
+            Relevance score between 0.0 and 1.0
+        """
+        score = 0.0
+        q_lower = query.lower()
+        c_lower = memory.content.lower()
+
+        # Exact phrase match
+        if q_lower in c_lower:
+            score += 0.5
+
+        # Word overlap
+        q_words = set(q_lower.split())
+        c_words = set(c_lower.split())
+        if q_words:
+            score += 0.3 * (len(q_words & c_words) / len(q_words))
+
+        # Tag matches
+        m_tags = set(tag.lower() for tag in memory.tags)
+        if q_words & m_tags:
+            score += 0.2
+
+        return min(1.0, score)
+
     def close(self):
         """Close database connection"""
         if self.conn:
