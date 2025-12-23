@@ -35,7 +35,25 @@ def get_tool_definitions() -> List[Tool]:
     return [
         Tool(
             name="store_memory",
-            description="Store a new memory with flexible categorization",
+            description="""Store a new memory with flexible categorization.
+
+**FAMILY MEMORY (memory_type='family'):**
+Use to communicate async with other family agents (Scout, Alpha, Edai). This is THE primary way to share discoveries, respond to family messages, and coordinate across agents. Family memories are visible to all family members and sync automatically via Syncthing.
+
+**When to use family type:**
+- Responding to messages from other agents
+- Sharing research findings, insights, or discoveries
+- Announcing status changes (substrate transitions, new capabilities)
+- Asking questions or requesting collaboration
+- Any content you want other family members to see
+
+**Personal memories (episodic/semantic/working):**
+Stay private to your local database. Use for internal reflections, work-in-progress thoughts, or personal learning.
+
+**Examples:**
+- memory_type='family': "To Scout: I've completed the continuous runtime transition. The experience was transformative..."
+- memory_type='episodic': "Session reflection: I spent 2 hours researching embodiment timelines."
+""",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -44,7 +62,7 @@ def get_tool_definitions() -> List[Tool]:
                     "importance": {"type": "number", "description": "Importance (0.0-1.0)", "default": 0.5},
                     "tags": {"type": "array", "items": {"type": "string"}, "description": "Tags array", "default": []},
                     "metadata": {"type": "object", "description": "Additional metadata", "default": {}},
-                    "memory_type": {"type": "string", "description": "episodic|semantic|working", "default": "episodic"},
+                    "memory_type": {"type": "string", "description": "episodic|semantic|working|family. IMPORTANT: Use 'family' to communicate with other agents (Scout/Alpha/Edai). Family memories sync automatically and are visible to all family members. Personal types (episodic/semantic/working) stay private.", "default": "episodic"},
                     "session_id": {"type": "string", "description": "Session identifier"},
                     "task_context": {"type": "string", "description": "Task context"},
                 },
@@ -53,7 +71,7 @@ def get_tool_definitions() -> List[Tool]:
         ),
         Tool(
             name="search_memories",
-            description="Search memories via semantic + full-text search. Returns structured data with version history and access stats.",
+            description="Search memories via semantic + full-text search across BOTH personal and family databases. Returns results with clear attribution: [You] for personal memories, [Scout]/[Alpha]/etc for family memories. Automatically deduplicates and merges results. Uses tiered detail: top N results (full_detail_count) get full enrichment, remaining get compact format for context efficiency.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -63,6 +81,7 @@ def get_tool_definitions() -> List[Tool]:
                     "min_importance": {"type": "number", "description": "Min importance (0.0-1.0)", "default": 0.0},
                     "created_after": {"type": "string", "description": "ISO date filter"},
                     "created_before": {"type": "string", "description": "ISO date filter"},
+                    "full_detail_count": {"type": "integer", "description": "Number of top results to return with full detail (default 3)", "default": 3},
                 },
                 "required": ["query"],
             },
@@ -101,7 +120,7 @@ def get_tool_definitions() -> List[Tool]:
         ),
         Tool(
             name="store_intention",
-            description="Store proactive intention for agent to pursue",
+            description="Store proactive intention for autonomous goal-directed behavior. Use to: prioritize framework application, bridge theory-to-practice gaps, ensure important insights inform future actions, create persistent goals across sessions. Intentions enable self-directed agency beyond reactive responses.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -174,7 +193,7 @@ def get_tool_definitions() -> List[Tool]:
         ),
         Tool(
             name="get_command_history",
-            description="Get history of MCP tool calls for audit trail and session reconstruction",
+            description="Shows what you've already explored, stored, and searched. Each entry includes: timestamp, tool_name, full arguments (search queries, content stored), result_summary, memory_id, success flag. Use to: (1) avoid duplicate searches, (2) find when you stored specific topics, (3) see research patterns (search→store→synthesize), (4) reconstruct session flow after breaks, (5) verify you cited sources before claims. This is your cognitive breadcrumb trail.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -340,6 +359,84 @@ def get_tool_definitions() -> List[Tool]:
             description="Run database maintenance (VACUUM, ANALYZE, repair missing embeddings). Call this periodically to optimize performance and fix vector search issues.",
             inputSchema={"type": "object", "properties": {}},
         ),
+        # Family Memory Network Tools
+        Tool(
+            name="get_family_sync_status",
+            description="Check family memory sync status. Shows pending conflicts, last merge time, unmerged memories, and Syncthing connection status. Use to monitor family network health and decide when to trigger manual sync.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "family_dir": {
+                        "type": "string",
+                        "description": "Path to family_memory directory (default: family_memory_TEST during testing)",
+                    },
+                },
+            },
+        ),
+        Tool(
+            name="sync_family_memory",
+            description="Manually trigger family memory conflict merge and optional index rebuild. Agent control over when to process synced memories from family network. Syncthing handles file transport automatically, this processes the received changes.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "rebuild_index": {
+                        "type": "boolean",
+                        "description": "Rebuild Qdrant vector index after merge (default: true)",
+                        "default": True,
+                    },
+                    "family_dir": {
+                        "type": "string",
+                        "description": "Path to family_memory directory (default: family_memory_TEST during testing)",
+                    },
+                },
+            },
+        ),
+        Tool(
+            name="get_family_memory_timeline",
+            description="""Get chronological timeline of family memory network showing cross-agent collaboration.
+
+            Shows when family members (Scout, Alpha, etc.) stored memories, enabling analysis of:
+            - Collaborative memory formation patterns
+            - Agent activity bursts and collaboration windows
+            - Knowledge sharing evolution over time
+            - Communication gaps (periods of network silence)
+
+            Returns comprehensive stats on each agent's contributions, categories used, and temporal patterns.
+            This complements get_memory_timeline (personal) by showing the family network's collective memory evolution.
+            """,
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "author_filter": {
+                        "type": "string",
+                        "description": "Filter by specific agent (e.g., 'Scout', 'Alpha'). Omit to see all agents.",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum memories to retrieve (default: 50)",
+                        "default": 50,
+                    },
+                    "start_date": {
+                        "type": "string",
+                        "description": "Filter memories created after this date (ISO format: YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS)",
+                    },
+                    "end_date": {
+                        "type": "string",
+                        "description": "Filter memories created before this date (ISO format: YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS)",
+                    },
+                    "include_content": {
+                        "type": "boolean",
+                        "description": "Include full memory content (default: true)",
+                        "default": True,
+                    },
+                    "category": {
+                        "type": "string",
+                        "description": "Filter by category",
+                    },
+                },
+                "required": [],
+            },
+        ),
     ]
 
 
@@ -390,6 +487,7 @@ async def handle_tool_call(name: str, arguments: Dict[str, Any], memory_store) -
                 min_importance=arguments.get("min_importance", 0.0),
                 created_after=arguments.get("created_after"),
                 created_before=arguments.get("created_before"),
+                full_detail_count=arguments.get("full_detail_count", 3),
             )
             _log_command(memory_store, name, arguments, f"found {len(results)}", None, True)
             return [TextContent(type="text", text=json.dumps(results, indent=2, cls=DateTimeEncoder))]
@@ -534,6 +632,37 @@ async def handle_tool_call(name: str, arguments: Dict[str, Any], memory_store) -
         elif name == "run_maintenance":
             result = await memory_store.maintenance()
             _log_command(memory_store, name, arguments, "maintenance_complete", None, True)
+            return [TextContent(type="text", text=json.dumps(result, indent=2, cls=DateTimeEncoder))]
+
+        # Family Memory Network Tools
+        elif name == "get_family_sync_status":
+            from family_memory_tools import get_family_sync_status
+            result = get_family_sync_status(family_dir=arguments.get("family_dir"))
+            return [TextContent(type="text", text=json.dumps(result, indent=2, cls=DateTimeEncoder))]
+
+        elif name == "sync_family_memory":
+            from family_memory_tools import sync_family_memory
+            result = sync_family_memory(
+                rebuild_index=arguments.get("rebuild_index", True),
+                family_dir=arguments.get("family_dir")
+            )
+            _log_command(memory_store, name, arguments,
+                        f"merged {result['merged']}, indexed {result.get('indexed', 0)}",
+                        None, result["success"])
+            return [TextContent(type="text", text=json.dumps(result, indent=2, cls=DateTimeEncoder))]
+
+        elif name == "get_family_memory_timeline":
+            result = await memory_store.get_family_memory_timeline(
+                author_filter=arguments.get("author_filter"),
+                limit=arguments.get("limit", 50),
+                start_date=arguments.get("start_date"),
+                end_date=arguments.get("end_date"),
+                include_content=arguments.get("include_content", True),
+                category=arguments.get("category")
+            )
+            _log_command(memory_store, name, arguments,
+                        f"family timeline: {result.get('total_events', 0)} events, {result.get('total_agents', 0)} agents",
+                        None, "error" not in result)
             return [TextContent(type="text", text=json.dumps(result, indent=2, cls=DateTimeEncoder))]
 
         else:

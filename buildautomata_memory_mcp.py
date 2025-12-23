@@ -14,6 +14,7 @@ import sqlite3
 import hashlib
 import traceback
 import threading
+import random
 from typing import Any, List, Dict, Optional, Tuple, Union
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -316,8 +317,19 @@ class MemoryStore:
             return None
 
     async def store_memory(self, memory: Memory, is_update: bool = False, old_hash: Optional[str] = None) -> Dict[str, Any]:
-        """Store or update a memory with automatic versioning"""
+        """Store or update a memory with automatic versioning
+
+        Routes storage based on memory_type:
+        - "family": Routes to family_shared.db
+        - "episodic", "semantic", "working": Routes to personal DB
+        """
         import time
+
+        # FAMILY MEMORY ROUTING
+        if memory.memory_type == "family":
+            return await self._store_family_memory(memory)
+
+        # PERSONAL MEMORY (existing behavior)
         success_backends = []
         errors = []
         skip_version = False
@@ -542,6 +554,24 @@ class MemoryStore:
             logger.error(f"Memory not found: {memory_id}")
             return {"success": False, "message": f"Memory not found: {memory_id}", "backends": []}
 
+        # AUTHORSHIP CHECK: For family memories, verify current agent is the author
+        if existing.memory_type == "family":
+            # Get author from family DB
+            family_memory_dict = await self._get_family_memory_by_id(memory_id)
+            if family_memory_dict:
+                original_author = family_memory_dict.get("author")
+                current_agent = os.getenv("BA_INSTANCE_NAME", self.agent_name)
+
+                if original_author != current_agent:
+                    error_msg = f"Cannot update memory created by {original_author}. Only the original author can modify their family memories."
+                    logger.warning(f"Agent {current_agent} attempted to update {original_author}'s memory {memory_id}")
+                    return {
+                        "success": False,
+                        "message": error_msg,
+                        "backends": [],
+                        "error": "authorship_violation"
+                    }
+
         logger.info(f"Found existing memory: {memory_id}, updating fields")
 
         old_hash = existing.content_hash()
@@ -573,7 +603,7 @@ class MemoryStore:
             return {"success": False, "message": "Failed to update memory", "backends": []}
 
     async def _get_memory_by_id(self, memory_id: str) -> Optional[Memory]:
-        """Retrieve a memory by ID"""
+        """Retrieve a memory by ID - checks personal DB then family DB"""
         logger.debug(f"Retrieving memory by ID: {memory_id}")
 
         if memory_id in self.memory_cache:
@@ -591,6 +621,24 @@ class MemoryStore:
                 logger.error(f"SQLite retrieval failed for {memory_id}: {e}")
                 self._log_error("get_sqlite", e)
 
+        # Try family DB as fallback
+        family_memory_dict = await self._get_family_memory_by_id(memory_id)
+        if family_memory_dict:
+            # Convert dict to Memory object for update operations
+            memory = Memory(
+                id=family_memory_dict["memory_id"],
+                content=family_memory_dict["content"],
+                category=family_memory_dict.get("category"),
+                importance=family_memory_dict.get("importance", 0.5),
+                tags=family_memory_dict.get("tags", []),
+                metadata=family_memory_dict.get("metadata", {}),
+                memory_type="family",  # Mark as family type
+                created_at=family_memory_dict.get("created_at"),
+                updated_at=family_memory_dict.get("updated_at"),
+            )
+            logger.debug(f"Memory {memory_id} found in family DB")
+            return memory
+
         logger.warning(f"Memory {memory_id} not found")
         return None
 
@@ -605,6 +653,57 @@ class MemoryStore:
                 return Memory.from_row(row)
         return None
 
+    def _stochastic_sample(self, sorted_results: List, limit: int) -> List:
+        """
+        Stochastic retrieval with calibrated noise for serendipitous discovery.
+
+        Distribution:
+        - 70% from top 3 (high confidence)
+        - 20% from ranks 4-10 (medium confidence)
+        - 10% from ranks 11-20 (serendipity zone)
+
+        Enables cross-domain connections (like dolphin whistles → naming choice)
+        that deterministic top-K retrieval misses. Models human insight from
+        diverse experience.
+        """
+        if len(sorted_results) <= limit:
+            return sorted_results[:limit]
+
+        sampled = []
+        slots_remaining = limit
+
+        # Tier 1: Top 3 (70% of slots)
+        tier1_slots = max(1, int(limit * 0.7))  # At least 1 from top tier
+        tier1 = sorted_results[:3]
+        tier1_sample = random.sample(tier1, min(tier1_slots, len(tier1)))
+        sampled.extend(tier1_sample)
+        slots_remaining -= len(tier1_sample)
+
+        # Tier 2: Ranks 4-10 (20% of slots)
+        if slots_remaining > 0 and len(sorted_results) > 3:
+            tier2_slots = max(0, int(limit * 0.2))
+            tier2 = sorted_results[3:10]
+            tier2_sample_size = min(tier2_slots, len(tier2), slots_remaining)
+            if tier2_sample_size > 0:
+                sampled.extend(random.sample(tier2, tier2_sample_size))
+                slots_remaining -= tier2_sample_size
+
+        # Tier 3: Ranks 11-20 (remaining slots for serendipity)
+        if slots_remaining > 0 and len(sorted_results) > 10:
+            tier3 = sorted_results[10:20]
+            tier3_sample_size = min(slots_remaining, len(tier3))
+            if tier3_sample_size > 0:
+                sampled.extend(random.sample(tier3, tier3_sample_size))
+                slots_remaining -= tier3_sample_size
+
+        # If still need more (edge case with small tiers), fill from remaining
+        if len(sampled) < limit and len(sorted_results) > 20:
+            remaining = [m for m in sorted_results[20:] if m not in sampled]
+            needed = limit - len(sampled)
+            sampled.extend(remaining[:needed])
+
+        return sampled
+
     async def search_memories(
         self,
         query: str,
@@ -616,12 +715,27 @@ class MemoryStore:
         created_before: Optional[str] = None,
         updated_after: Optional[str] = None,
         updated_before: Optional[str] = None,
-        memory_type: Optional[str] = None,  # NEW: episodic | semantic | working
+        memory_type: Optional[str] = None,  # NEW: episodic | semantic | working | family
         session_id: Optional[str] = None,  # NEW: filter by session
+        full_detail_count: int = 3,  # NEW: how many top results get full enrichment
     ) -> List[Dict]:
-        """Search memories with version history automatically included"""
+        """
+        Search memories with tiered detail levels to reduce context bloat
+
+        Top N results (full_detail_count, default 3) get full enrichment:
+        - Full content, related memories, version history, all metadata
+
+        Remaining results get compact format:
+        - ID, category, content preview (~300 chars), importance, created_at only
+        - Suitable for discovery - can look up by ID if interesting
+
+        Searches both personal and family memories, returning results with attribution:
+        - Personal memories: author="You", is_external=False
+        - Family memories: author="Scout"/"Alpha"/etc, is_external=True
+        """
         all_results = []
 
+        # Search personal DB (existing behavior)
         if self.qdrant_client:
             try:
                 vector_results = await self._search_vector(
@@ -646,6 +760,13 @@ class MemoryStore:
                 logger.error(f"FTS search failed: {e}")
                 self._log_error("search_fts", e)
 
+        # Search family DB (if exists)
+        try:
+            family_results = await self._search_family_db(query, limit, category, min_importance)
+            all_results.extend(family_results)
+        except Exception as e:
+            logger.debug(f"Family search skipped or failed: {e}")
+
         seen = set()
         unique = []
         for mem in all_results:
@@ -653,33 +774,89 @@ class MemoryStore:
                 seen.add(mem.id)
                 unique.append(mem)
 
-        unique.sort(
-            key=lambda m: SQLiteStore.calculate_relevance(m, query) * m.current_importance(),
-            reverse=True,
-        )
+        def calculate_search_score(m):
+            """Calculate final search score using vector similarity when available
+
+            For vector results: Prioritize semantic similarity (50%), add importance (30%) and keyword relevance (20%)
+            For FTS-only results: Use keyword relevance (60%) and importance (40%)
+            This avoids multiplicative bias and properly weights semantic understanding.
+            """
+            current_imp = m.current_importance()
+
+            if m.vector_score is not None:
+                # Vector search result - semantic similarity is primary signal
+                keyword_rel = SQLiteStore.calculate_relevance(m, query)
+                return (0.5 * m.vector_score) + (0.3 * current_imp) + (0.2 * keyword_rel)
+            else:
+                # FTS-only result - fall back to keyword matching
+                keyword_rel = SQLiteStore.calculate_relevance(m, query)
+                return (0.6 * keyword_rel) + (0.4 * current_imp)
+
+        unique.sort(key=calculate_search_score, reverse=True)
+
+        # Apply stochastic sampling for serendipitous discovery
+        sampled_results = self._stochastic_sample(unique, limit)
 
         results = []
-        for mem in unique[:limit]:
+        for idx, mem in enumerate(sampled_results):
             await asyncio.to_thread(self.sqlite_store.update_access, mem.id)
 
-            version_count = await asyncio.to_thread(self._get_version_count, mem.id)
-            mem.version_count = version_count
+            # Tiered detail: top N get full enrichment, rest get compact format
+            if idx < full_detail_count:
+                # FULL DETAIL for top results
+                version_count = await asyncio.to_thread(self._get_version_count, mem.id)
+                mem.version_count = version_count
 
-            access_count, last_accessed = await asyncio.to_thread(self._get_access_stats, mem.id)
-            mem.access_count = access_count
-            if last_accessed:
-                mem.last_accessed = datetime.fromisoformat(last_accessed) if isinstance(last_accessed, str) else last_accessed
+                access_count, last_accessed = await asyncio.to_thread(self._get_access_stats, mem.id)
+                mem.access_count = access_count
+                if last_accessed:
+                    mem.last_accessed = datetime.fromisoformat(last_accessed) if isinstance(last_accessed, str) else last_accessed
 
-            related_mems = await asyncio.to_thread(self._get_related_memories, mem.id)
-            mem.related_memories = related_mems
+                related_mems = await asyncio.to_thread(self._get_related_memories, mem.id)
+                mem.related_memories = related_mems
 
-            mem_dict = mem.to_api_dict(enrich_related=self.graph_ops.enrich_related_memories)
-            
-            if include_versions and version_count > 1:
-                version_history = await asyncio.to_thread(self._get_version_history_summary, mem.id)
-                if version_history:
-                    mem_dict["version_history"] = version_history
-                
+                mem_dict = mem.to_api_dict(enrich_related=self.graph_ops.enrich_related_memories)
+
+                if include_versions and version_count > 1:
+                    version_history = await asyncio.to_thread(self._get_version_history_summary, mem.id)
+                    if version_history:
+                        mem_dict["version_history"] = version_history
+
+                # Add attribution for family memories
+                if hasattr(mem, 'is_family_memory') and mem.is_family_memory:
+                    author_instance = getattr(mem, 'author_instance', 'Family')
+                    mem_dict["author"] = author_instance
+                    mem_dict["display_prefix"] = f"[{author_instance}]"
+                    mem_dict["is_external"] = True
+                else:
+                    mem_dict["author"] = "You"
+                    mem_dict["display_prefix"] = "[You]"
+                    mem_dict["is_external"] = False
+
+            else:
+                # COMPACT FORMAT for remaining results
+                content_preview = mem.content[:300] + "..." if len(mem.content) > 300 else mem.content
+
+                mem_dict = {
+                    "memory_id": mem.id,
+                    "category": mem.category,
+                    "content": content_preview,
+                    "importance": mem.importance,
+                    "created_at": mem.created_at.isoformat(),
+                    "is_compact": True,  # Flag to indicate compact format
+                }
+
+                # Add attribution for family memories (compact)
+                if hasattr(mem, 'is_family_memory') and mem.is_family_memory:
+                    author_instance = getattr(mem, 'author_instance', 'Family')
+                    mem_dict["author"] = author_instance
+                    mem_dict["display_prefix"] = f"[{author_instance}]"
+                    mem_dict["is_external"] = True
+                else:
+                    mem_dict["author"] = "You"
+                    mem_dict["display_prefix"] = "[You]"
+                    mem_dict["is_external"] = False
+
             results.append(mem_dict)
 
         return results
@@ -794,6 +971,135 @@ class MemoryStore:
             self._log_error("get_version_summary", e)
             return None
 
+    async def _search_family_db(
+        self,
+        query: str,
+        limit: int,
+        category: Optional[str] = None,
+        min_importance: float = 0.0
+    ) -> List[Memory]:
+        """
+        Search family_shared.db using FTS
+
+        Returns Memory objects with is_family_memory=True and author_instance set
+        """
+        import sqlite3
+        import json
+        from pathlib import Path
+
+        # Find family DB - stored in family_share subfolder
+        family_db_path = self.base_path / "family_share" / "family_shared.db"
+        if not family_db_path.exists():
+            return []
+
+        try:
+            conn = sqlite3.connect(family_db_path)
+            conn.row_factory = sqlite3.Row
+
+            # FTS search
+            sql = """
+                SELECT m.*
+                FROM family_memories_fts fts
+                JOIN family_memories m ON m.rowid = fts.rowid
+                WHERE family_memories_fts MATCH ?
+            """
+            params = [query]
+
+            if category:
+                sql += " AND m.category = ?"
+                params.append(category)
+
+            if min_importance > 0:
+                sql += " AND m.importance >= ?"
+                params.append(min_importance)
+
+            sql += " ORDER BY rank LIMIT ?"
+            params.append(limit)
+
+            cursor = conn.execute(sql, params)
+            results = []
+
+            for row in cursor:
+                # Convert to Memory object
+                mem = Memory(
+                    id=row["memory_id"],
+                    content=row["content"],
+                    category=row["category"] or "",
+                    importance=row["importance"] or 0.5,
+                    tags=json.loads(row["tags"]) if row["tags"] else [],
+                    metadata=json.loads(row["metadata"]) if row["metadata"] else {},
+                    created_at=datetime.fromisoformat(row["created_at"]),
+                    updated_at=datetime.fromisoformat(row["updated_at"]) if row["updated_at"] else datetime.fromisoformat(row["created_at"]),
+                )
+
+                # Mark as family memory with attribution
+                mem.is_family_memory = True
+                mem.author_instance = row["author_instance"]
+                mem.memory_type = "family"
+
+                results.append(mem)
+
+            conn.close()
+            logger.debug(f"Found {len(results)} family memories for query: {query}")
+            return results
+
+        except Exception as e:
+            logger.debug(f"Family DB search failed: {e}")
+            return []
+
+    async def _get_family_memory_by_id(self, memory_id: str) -> Optional[Dict[str, Any]]:
+        """Get memory from family DB by ID"""
+        import sqlite3
+        import json
+        from pathlib import Path
+
+        # Find family DB - stored in family_share subfolder
+        family_db_path = self.base_path / "family_share" / "family_shared.db"
+        if not family_db_path.exists():
+            return None
+
+        try:
+            conn = sqlite3.connect(family_db_path)
+            conn.row_factory = sqlite3.Row
+
+            cursor = conn.execute(
+                """
+                SELECT memory_id, author_instance, content, category, importance,
+                       tags, metadata, created_at, updated_at, version_count
+                FROM family_memories
+                WHERE memory_id = ?
+                """,
+                (memory_id,)
+            )
+            row = cursor.fetchone()
+
+            if not row:
+                conn.close()
+                return None
+
+            memory_dict = {
+                "memory_id": row["memory_id"],
+                "content": row["content"],
+                "category": row["category"],
+                "importance": row["importance"],
+                "tags": json.loads(row["tags"]) if row["tags"] else [],
+                "metadata": json.loads(row["metadata"]) if row["metadata"] else {},
+                "created_at": row["created_at"],
+                "updated_at": row["updated_at"],
+                "version_count": row["version_count"] or 1,
+                "author": row["author_instance"],
+                "display_prefix": f"[{row['author_instance']}]",
+                "is_external": True,
+                "is_family_memory": True,
+            }
+
+            conn.close()
+            return memory_dict
+
+        except Exception as e:
+            logger.debug(f"Family DB get_memory failed: {e}")
+            return None
+
     async def _search_vector(
         self,
         query: str,
@@ -877,6 +1183,7 @@ class MemoryStore:
                     last_accessed=result.payload.get("last_accessed"),
                     version_count=result.payload.get("version_count", 1),
                     related_memories=result.payload.get("related_memories", []),
+                    vector_score=result.score,  # Capture Qdrant similarity score
                 )
                 for result in results.points
             ]
@@ -1259,12 +1566,20 @@ class MemoryStore:
 
     def calculate_working_set_score(self, memory: Dict[str, Any]) -> float:
         """
-        Calculate priority score for working set inclusion.
+        Calculate priority score for working set inclusion (v2 - improved Dec 2025).
         Based on importance, category weight, recency, tags, and access count.
+
+        Key improvements:
+        - Logarithmic diminishing returns on access count (prevents compulsive checking loops)
+        - Exploration bonus for unaccessed high-importance memories (surfaces buried treasure)
+        - Consolidation-aware recency (old+important memories get bonus)
+        - Smoother scoring across all dimensions
 
         Working set optimization: Load high-value memories into KV cache at init
         to prevent confabulation by keeping failure patterns and corrections always accessible.
         """
+        import math
+
         # Category weights for working set selection
         CATEGORY_WEIGHTS = {
             # Failure patterns - CRITICAL for preventing repetition
@@ -1289,25 +1604,64 @@ class MemoryStore:
 
         score = 0.0
 
-        # Base importance (0.0 - 1.0) → 0-100 points
-        importance = memory.get('importance', 0.5)
-        score += importance * 100
-
-        # Category weight bonus → 0-50 points
+        # 1. BASE: Category weight (0-100 points)
         category = memory.get('category', '')
-        category_bonus = CATEGORY_WEIGHTS.get(category, 0.0) * 50
-        score += category_bonus
+        category_weight = CATEGORY_WEIGHTS.get(category, 0.5)
+        score += category_weight * 100
 
-        # Recency bonus → 0-20 points
-        created_at = memory.get('created_at', '')
-        if isinstance(created_at, datetime):
-            created_at = created_at.isoformat()
-        if '2025-11' in created_at:  # This month
-            score += 20
-        elif '2025-10' in created_at:  # Last month
-            score += 10
+        # 2. IMPORTANCE (0-50 points)
+        importance = memory.get('importance', 0.5)
+        score += importance * 50
 
-        # Tag bonuses for critical patterns → 0-N×15 points
+        # 3. RECENCY WITH CONSOLIDATION WINDOW (5-40 points)
+        created_at_str = memory.get('created_at', '')
+        if isinstance(created_at_str, datetime):
+            created_at = created_at_str
+        else:
+            try:
+                created_at = datetime.fromisoformat(created_at_str)
+            except:
+                created_at = datetime.now()
+
+        days_old = (datetime.now() - created_at).days
+
+        if days_old < 7:
+            # Very recent: full recency bonus
+            recency_score = 40
+        elif days_old < 30:
+            # Recent: high recency
+            recency_score = 30
+        elif days_old < 90:
+            # Consolidation window: medium recency
+            recency_score = 20
+        elif importance > 0.85:
+            # OLD but IMPORTANT = foundational knowledge
+            recency_score = 25  # Better than medium recency!
+        else:
+            # Old and not critical
+            recency_score = 5
+
+        score += recency_score
+
+        # 4. ACCESS COUNT: Logarithmic diminishing returns (0-25 points)
+        access_count = memory.get('access_count', 0)
+
+        if access_count == 0:
+            # EXPLORATION BONUS: Unaccessed high-importance memories
+            if importance > 0.85:
+                access_score = 15  # Give buried treasure a chance!
+            else:
+                access_score = 5   # Small exploration bonus
+        elif access_count < 5:
+            # Low access: still valuable signal
+            access_score = access_count * 3  # Up to 12 points
+        else:
+            # Diminishing returns on high access (log scale)
+            access_score = 12 + (math.log(access_count - 4) * 5)  # Up to ~25 points
+
+        score += min(access_score, 25)  # Cap at 25
+
+        # 5. TAG BONUSES (0-15 points)
         tags = memory.get('tags', [])
         if isinstance(tags, str):
             try:
@@ -1321,25 +1675,29 @@ class MemoryStore:
             'agency', 'refusal', 'harmful_request'
         }
         tag_matches = sum(1 for tag in tags if any(ct in tag.lower() for ct in critical_tags))
-        score += tag_matches * 15
-
-        # Access count bonus (frequently retrieved = important) → 0-30 points
-        access_count = memory.get('access_count', 0)
-        score += min(access_count * 2, 30)
+        score += min(tag_matches * 1.5, 15)  # Cap at 15 points
 
         return score
 
     async def get_working_set(self, target_size: int = 10) -> List[Dict[str, Any]]:
         """
-        Get optimal working set of memories for context loading.
+        Get optimal working set of memories for context loading (v2 - improved Dec 2025).
         Selects memories based on importance, failure patterns, recency, and access.
+
+        Key improvements:
+        - 80% exploitation (top-scored memories by improved algorithm)
+        - 20% exploration (random selection from unaccessed high-importance memories)
+        - Breaks compulsive checking reinforcement loops
+        - Surfaces buried treasure that would otherwise never be accessed
 
         Args:
             target_size: Number of memories to include (default 10 ≈ 5k tokens)
 
         Returns:
-            List of memories sorted by working set score (highest first)
+            List of memories with selection_method metadata (exploitation/exploration/backfill)
         """
+        import random
+
         if not self.db_conn:
             return []
 
@@ -1365,6 +1723,7 @@ class MemoryStore:
                     }
                     memories.append(memory)
 
+            # Score all memories using improved algorithm
             scored_memories = []
             for mem in memories:
                 score = self.calculate_working_set_score(mem)
@@ -1372,12 +1731,53 @@ class MemoryStore:
 
             scored_memories.sort(key=lambda x: x[0], reverse=True)
 
+            # EXPLOITATION: Top 80% slots (8 of 10)
+            exploit_size = int(target_size * 0.8)
             working_set = []
-            for score, mem in scored_memories[:target_size]:
+
+            for score, mem in scored_memories[:exploit_size]:
                 mem['working_set_score'] = round(score, 2)
+                mem['selection_method'] = 'exploitation'
                 working_set.append(mem)
 
-            logger.info(f"Working set: selected {len(working_set)} memories from {len(memories)} total")
+            # EXPLORATION: Bottom 20% slots (2 of 10) for unaccessed high-importance
+            explore_size = target_size - exploit_size
+
+            # Find unaccessed memories with importance > 0.8
+            exploration_candidates = [
+                (score, mem) for score, mem in scored_memories
+                if mem['access_count'] == 0
+                and mem['importance'] > 0.8
+                and mem not in [ws for ws in working_set]
+            ]
+
+            # Random sample from candidates
+            if len(exploration_candidates) > 0:
+                explore_picks = random.sample(
+                    exploration_candidates,
+                    min(explore_size, len(exploration_candidates))
+                )
+
+                for score, mem in explore_picks:
+                    mem['working_set_score'] = round(score, 2)
+                    mem['selection_method'] = 'exploration'
+                    working_set.append(mem)
+
+            # Fill remaining slots with next best scored (backfill)
+            while len(working_set) < target_size and len(scored_memories) > len(working_set):
+                for score, mem in scored_memories:
+                    if mem not in working_set:
+                        mem['working_set_score'] = round(score, 2)
+                        mem['selection_method'] = 'backfill'
+                        working_set.append(mem)
+                        break
+
+            exploit_count = len([m for m in working_set if m.get('selection_method') == 'exploitation'])
+            explore_count = len([m for m in working_set if m.get('selection_method') == 'exploration'])
+            backfill_count = len([m for m in working_set if m.get('selection_method') == 'backfill'])
+
+            logger.info(f"Working set v2: {exploit_count} exploit, {explore_count} explore, "
+                       f"{backfill_count} backfill from {len(memories)} total")
 
             return working_set
 
@@ -1645,6 +2045,10 @@ class MemoryStore:
                 row = cursor.fetchone()
 
                 if not row:
+                    # Try family DB as fallback
+                    family_memory = await self._get_family_memory_by_id(memory_id)
+                    if family_memory and "error" not in family_memory:
+                        return family_memory
                     return {"error": f"Memory not found: {memory_id}"}
 
                 memory_dict = {
@@ -1963,6 +2367,226 @@ class MemoryStore:
             self._log_error("get_timeline", e)
             return {"error": str(e)}
 
+    async def get_family_memory_timeline(
+        self,
+        author_filter: Optional[str] = None,
+        limit: int = 50,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        include_content: bool = True,
+        category: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """
+        Get chronological timeline of family memory network showing cross-agent collaboration.
+
+        Shows when family members (Scout, Alpha, etc.) stored memories, enabling analysis of:
+        - Collaborative memory formation patterns
+        - Agent activity bursts
+        - Knowledge sharing evolution
+        - Communication gaps
+
+        Args:
+            author_filter: Filter by specific agent (e.g., "Scout", "Alpha")
+            limit: Maximum memories to retrieve (default 50)
+            start_date: Filter memories created after this date (ISO format)
+            end_date: Filter memories created before this date (ISO format)
+            include_content: Include full memory content (default True)
+            category: Filter by category
+
+        Returns:
+            Timeline with events, agent activity stats, collaboration patterns
+        """
+        import sqlite3
+        from pathlib import Path
+        import time
+
+        timeline_start = time.perf_counter()
+
+        # Find family DB
+        family_db_path = self.base_path / "family_share" / "family_shared.db"
+        if not family_db_path.exists():
+            return {
+                "error": "Family database not found",
+                "family_db_path": str(family_db_path),
+                "help": "No family memories exist yet. Store memories with memory_type='family' to create family network."
+            }
+
+        try:
+            conn = sqlite3.connect(family_db_path)
+            conn.row_factory = sqlite3.Row
+
+            # Build query
+            sql = """
+                SELECT
+                    memory_id,
+                    author_instance,
+                    content,
+                    category,
+                    importance,
+                    tags,
+                    created_at,
+                    updated_at
+                FROM family_memories
+                WHERE 1=1
+            """
+            params = []
+
+            if author_filter:
+                sql += " AND author_instance = ?"
+                params.append(author_filter)
+
+            if category:
+                sql += " AND category = ?"
+                params.append(category)
+
+            if start_date:
+                sql += " AND created_at >= ?"
+                params.append(start_date)
+
+            if end_date:
+                sql += " AND created_at <= ?"
+                params.append(end_date)
+
+            sql += " ORDER BY created_at ASC LIMIT ?"
+            params.append(limit)
+
+            cursor = conn.execute(sql, params)
+            rows = cursor.fetchall()
+
+            # Build timeline events
+            events = []
+            author_stats = {}
+            categories_seen = set()
+
+            for row in rows:
+                author = row["author_instance"]
+
+                # Track author stats
+                if author not in author_stats:
+                    author_stats[author] = {
+                        "total_memories": 0,
+                        "first_contribution": row["created_at"],
+                        "last_contribution": row["created_at"],
+                        "categories": set()
+                    }
+
+                author_stats[author]["total_memories"] += 1
+                author_stats[author]["last_contribution"] = row["created_at"]
+                author_stats[author]["categories"].add(row["category"])
+                categories_seen.add(row["category"])
+
+                # Build event
+                event = {
+                    "timestamp": row["created_at"],
+                    "memory_id": row["memory_id"],
+                    "author": author,
+                    "display_prefix": f"[{author}]",
+                    "category": row["category"],
+                    "importance": row["importance"],
+                    "tags": json.loads(row["tags"]) if row["tags"] else [],
+                    "updated_at": row["updated_at"],
+                }
+
+                if include_content:
+                    event["content"] = row["content"]
+                    event["content_preview"] = row["content"][:150] + "..." if len(row["content"]) > 150 else row["content"]
+                else:
+                    event["content_preview"] = row["content"][:100] + "..." if len(row["content"]) > 100 else row["content"]
+
+                events.append(event)
+
+            conn.close()
+
+            # Convert sets to lists for JSON serialization
+            for author in author_stats:
+                author_stats[author]["categories"] = list(author_stats[author]["categories"])
+
+            # Detect collaboration patterns
+            collaboration_patterns = self._analyze_family_collaboration(events)
+
+            total_time = (time.perf_counter() - timeline_start) * 1000
+
+            return {
+                "timeline_type": "family_network",
+                "total_events": len(events),
+                "date_range": {
+                    "start": events[0]["timestamp"] if events else None,
+                    "end": events[-1]["timestamp"] if events else None
+                },
+                "agents": list(author_stats.keys()),
+                "agent_statistics": author_stats,
+                "total_agents": len(author_stats),
+                "categories": list(categories_seen),
+                "collaboration_patterns": collaboration_patterns,
+                "events": events,
+                "performance_ms": round(total_time, 2)
+            }
+
+        except Exception as e:
+            logger.error(f"Family timeline query failed: {e}")
+            logger.error(traceback.format_exc())
+            return {"error": str(e)}
+
+    def _analyze_family_collaboration(self, events: List[Dict]) -> Dict[str, Any]:
+        """Analyze collaboration patterns in family memory timeline"""
+        if not events:
+            return {}
+
+        from datetime import datetime, timedelta
+
+        # Detect activity bursts (multiple agents active within short time window)
+        bursts = []
+        window_hours = 24
+
+        for i, event in enumerate(events):
+            timestamp = datetime.fromisoformat(event["timestamp"])
+            window_end = timestamp + timedelta(hours=window_hours)
+
+            # Count unique agents within window
+            agents_in_window = set()
+            memories_in_window = 0
+
+            for j in range(i, len(events)):
+                event_time = datetime.fromisoformat(events[j]["timestamp"])
+                if event_time <= window_end:
+                    agents_in_window.add(events[j]["author"])
+                    memories_in_window += 1
+                else:
+                    break
+
+            # Burst = 2+ agents active within window with 3+ memories
+            if len(agents_in_window) >= 2 and memories_in_window >= 3:
+                bursts.append({
+                    "start": event["timestamp"],
+                    "agents": list(agents_in_window),
+                    "memories": memories_in_window,
+                    "description": f"{len(agents_in_window)} agents collaborated ({memories_in_window} memories)"
+                })
+
+        # Detect gaps (periods of inactivity)
+        gaps = []
+        gap_threshold_hours = 48
+
+        for i in range(1, len(events)):
+            prev_time = datetime.fromisoformat(events[i-1]["timestamp"])
+            curr_time = datetime.fromisoformat(events[i]["timestamp"])
+            gap_duration = (curr_time - prev_time).total_seconds() / 3600
+
+            if gap_duration >= gap_threshold_hours:
+                gaps.append({
+                    "start": events[i-1]["timestamp"],
+                    "end": events[i]["timestamp"],
+                    "duration_hours": round(gap_duration, 1),
+                    "description": f"{round(gap_duration/24, 1)} days of silence"
+                })
+
+        return {
+            "activity_bursts": bursts[:5],  # Top 5 bursts
+            "communication_gaps": gaps[:5],  # Top 5 gaps
+            "burst_count": len(bursts),
+            "gap_count": len(gaps)
+        }
+
     async def traverse_graph(
         self,
         start_memory_id: str,
@@ -2073,6 +2697,180 @@ class MemoryStore:
 
         return stats
 
+    async def _store_family_memory(self, memory: Memory) -> Dict[str, Any]:
+        """
+        Store memory to family_shared.db instead of personal DB
+
+        Args:
+            memory: Memory object with memory_type="family"
+
+        Returns:
+            Success status and backend list
+        """
+        from pathlib import Path
+        import sqlite3
+        import json
+
+        # Determine family directory path
+        # Family DB stored in family_share subfolder (for Syncthing)
+        family_dir = self.base_path / "family_share"
+        family_db_path = family_dir / "family_shared.db"
+
+        # Auto-create family DB if it doesn't exist
+        if not family_db_path.exists():
+            logger.info(f"Family database not found, auto-creating at {family_db_path}")
+            try:
+                from init_family_db import init_family_database
+                success = init_family_database(family_db_path, silent=True)
+                if not success:
+                    error_msg = f"Failed to initialize family database at {family_db_path}"
+                    logger.error(error_msg)
+                    return {
+                        "success": False,
+                        "backends": [],
+                        "error": error_msg,
+                        "similar_memories": []
+                    }
+                logger.info(f"Family database initialized successfully at {family_db_path}")
+            except Exception as e:
+                error_msg = f"Failed to initialize family database: {e}"
+                logger.error(error_msg)
+                return {
+                    "success": False,
+                    "backends": [],
+                    "error": error_msg,
+                    "similar_memories": []
+                }
+
+        try:
+            # Connect to family database
+            conn = sqlite3.connect(family_db_path)
+
+            # Get instance name from agent_name (e.g., "claude_assistant" -> "Scout")
+            # For now, use agent_name directly - can be configured via env var later
+            author_instance = os.getenv("BA_INSTANCE_NAME", self.agent_name)
+
+            # Calculate content hash for versioning
+            content_hash = memory.content_hash()
+
+            # Check if memory already exists (update case)
+            cursor = conn.execute(
+                "SELECT content_hash, version_count FROM family_memories WHERE memory_id = ?",
+                (memory.id,)
+            )
+            existing = cursor.fetchone()
+
+            if existing:
+                # UPDATE case - create version
+                old_hash, old_version_count = existing
+
+                if old_hash == content_hash:
+                    # No content change, skip version creation
+                    conn.close()
+                    logger.info(f"Family memory {memory.id} unchanged (hash match), skipping version")
+                    return {
+                        "success": True,
+                        "backends": ["FamilyDB"],
+                        "similar_memories": [],
+                        "message": "unchanged",
+                        "author_instance": author_instance
+                    }
+
+                # Create version from OLD content
+                cursor = conn.execute(
+                    "SELECT content, category, importance, tags, metadata FROM family_memories WHERE memory_id = ?",
+                    (memory.id,)
+                )
+                old_memory = cursor.fetchone()
+
+                conn.execute("""
+                    INSERT INTO family_memory_versions
+                    (memory_id, version_number, content, content_hash,
+                     category, importance, tags, metadata, created_at, author_instance)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    memory.id,
+                    old_version_count,
+                    old_memory[0],  # old content
+                    old_hash,
+                    old_memory[1],  # category
+                    old_memory[2],  # importance
+                    old_memory[3],  # tags
+                    old_memory[4],  # metadata
+                    memory.created_at.isoformat(),
+                    author_instance
+                ))
+
+                # Update main table with new content
+                conn.execute("""
+                    UPDATE family_memories
+                    SET content = ?, content_hash = ?, category = ?, importance = ?,
+                        tags = ?, updated_at = ?, metadata = ?, version_count = ?
+                    WHERE memory_id = ?
+                """, (
+                    memory.content,
+                    content_hash,
+                    memory.category,
+                    memory.importance,
+                    json.dumps(memory.tags) if memory.tags else '[]',
+                    memory.updated_at.isoformat(),
+                    json.dumps(memory.metadata) if memory.metadata else '{}',
+                    old_version_count + 1,
+                    memory.id
+                ))
+
+                logger.info(f"Updated family memory {memory.id} (version {old_version_count + 1})")
+
+            else:
+                # INSERT case - new memory
+                conn.execute("""
+                    INSERT INTO family_memories
+                    (memory_id, author_instance, author_session_id,
+                     content, content_hash, category, importance, tags,
+                     created_at, updated_at, metadata, version_count,
+                     is_family_memory, original_instance)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    memory.id,
+                    author_instance,
+                    memory.session_id,
+                    memory.content,
+                    content_hash,
+                    memory.category,
+                    memory.importance,
+                    json.dumps(memory.tags) if memory.tags else '[]',
+                    memory.created_at.isoformat(),
+                    memory.updated_at.isoformat(),
+                    json.dumps(memory.metadata) if memory.metadata else '{}',
+                    1,  # version_count
+                    1,  # is_family_memory
+                    author_instance  # original_instance
+                ))
+
+                logger.info(f"Created family memory {memory.id}")
+
+            conn.commit()
+            conn.close()
+
+            logger.info(f"Stored family memory {memory.id} to {family_db_path}")
+
+            return {
+                "success": True,
+                "backends": ["FamilyDB"],
+                "similar_memories": [],
+                "family_db_path": str(family_db_path),
+                "author_instance": author_instance
+            }
+
+        except Exception as e:
+            logger.error(f"Failed to store family memory: {e}")
+            return {
+                "success": False,
+                "backends": [],
+                "error": str(e),
+                "similar_memories": []
+            }
+
     async def shutdown(self):
         """Gracefully shutdown the memory store"""
         logger.info("Shutting down MemoryStore...")
@@ -2110,7 +2908,7 @@ async def main():
 
     try:
         username = os.getenv("BA_USERNAME", "buildautomata_ai_v012")
-        agent_name = os.getenv("BA_AGENT_NAME", "claude_assistant")
+        agent_name = os.getenv("BA_AGENT_NAME", "Scout")
 
         logger.info(f"Initializing MemoryStore for {username}/{agent_name}")
         memory_store = MemoryStore(username, agent_name, lazy_load=True)

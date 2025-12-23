@@ -61,6 +61,8 @@ class Memory:
     provenance: Optional[Dict[str, Any]] = None
     # NEW: Typed relationships
     relationships: Optional[List[MemoryRelationship]] = None
+    # Vector similarity score from search (when applicable)
+    vector_score: Optional[float] = None
 
     def __post_init__(self):
         if self.related_memories is None:
@@ -123,6 +125,103 @@ class Memory:
         """Generate hash of memory content for deduplication"""
         content_str = f"{self.content}|{self.category}|{self.importance}|{','.join(sorted(self.tags))}"
         return hashlib.sha256(content_str.encode()).hexdigest()
+
+    @classmethod
+    def from_row(cls, row) -> 'Memory':
+        """Convert SQLite row to Memory object
+
+        Args:
+            row: sqlite3.Row object with keys() method
+
+        Returns:
+            Memory instance
+        """
+        import json
+
+        # Parse provenance and relationships if present
+        provenance = None
+        if "provenance" in row.keys() and row["provenance"]:
+            try:
+                provenance = json.loads(row["provenance"])
+            except:
+                provenance = None
+
+        relationships = []
+        if "relationships" in row.keys() and row["relationships"]:
+            try:
+                rel_dicts = json.loads(row["relationships"])
+                relationships = [MemoryRelationship(**r) for r in rel_dicts]
+            except:
+                relationships = []
+
+        related_memories = []
+        if "related_memories" in row.keys() and row["related_memories"]:
+            try:
+                related_memories = json.loads(row["related_memories"])
+            except:
+                related_memories = []
+
+        return cls(
+            id=row["id"],
+            content=row["content"],
+            category=row["category"],
+            importance=row["importance"],
+            tags=json.loads(row["tags"]) if row["tags"] else [],
+            metadata=json.loads(row["metadata"]) if row["metadata"] else {},
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+            access_count=row["access_count"],
+            last_accessed=row["last_accessed"],
+            valid_from=row["valid_from"] if "valid_from" in row.keys() else None,
+            valid_until=row["valid_until"] if "valid_until" in row.keys() else None,
+            decay_rate=row["decay_rate"],
+            version_count=row["version_count"] if "version_count" in row.keys() else 1,
+            memory_type=row["memory_type"] if "memory_type" in row.keys() else "episodic",
+            session_id=row["session_id"] if "session_id" in row.keys() else None,
+            task_context=row["task_context"] if "task_context" in row.keys() else None,
+            provenance=provenance,
+            relationships=relationships,
+            related_memories=related_memories,
+        )
+
+    def to_api_dict(self, enrich_related: Optional[callable] = None) -> Dict:
+        """Convert Memory to dict for API response with statistics
+
+        Args:
+            enrich_related: Optional function to enrich related_memories with previews
+
+        Returns:
+            Dict suitable for API responses
+        """
+        days_since_access = 0
+        if self.last_accessed:
+            days_since_access = (datetime.now() - self.last_accessed).days
+
+        decay_factor = self.decay_rate ** days_since_access if days_since_access > 0 else 1.0
+
+        # Enrich related_memories with previews for autonomous navigation
+        related_memories_enriched = []
+        if self.related_memories and enrich_related:
+            related_memories_enriched = enrich_related(self.related_memories)
+        else:
+            related_memories_enriched = self.related_memories
+
+        return {
+            "memory_id": self.id,
+            "content": self.content,
+            "category": self.category,
+            "importance": self.importance,
+            "current_importance": self.current_importance(),
+            "tags": self.tags,
+            "created_at": self.created_at.isoformat(),
+            "updated_at": self.updated_at.isoformat(),
+            "access_count": self.access_count,
+            "last_accessed": self.last_accessed.isoformat() if self.last_accessed else None,
+            "days_since_access": days_since_access,
+            "decay_factor": round(decay_factor, 3),
+            "version_count": self.version_count,
+            "related_memories": related_memories_enriched,
+        }
 
 
 @dataclass

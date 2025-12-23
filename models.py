@@ -61,6 +61,8 @@ class Memory:
     provenance: Optional[Dict[str, Any]] = None
     # NEW: Typed relationships
     relationships: Optional[List[MemoryRelationship]] = None
+    # Vector similarity score from search (when applicable)
+    vector_score: Optional[float] = None
 
     def __post_init__(self):
         if self.related_memories is None:

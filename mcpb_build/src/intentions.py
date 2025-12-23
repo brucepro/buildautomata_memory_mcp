@@ -284,11 +284,14 @@ class IntentionManager:
                 """)
                 recent_memories = []
                 for row in cursor.fetchall():
+                    created_at = row['created_at']
+                    if isinstance(created_at, datetime):
+                        created_at = created_at.isoformat()
                     recent_memories.append({
                         "id": row['id'],
                         "content": row['content'],
                         "category": row['category'],
-                        "created_at": row['created_at'],
+                        "created_at": created_at,
                     })
 
             scan_results["context_summary"] = {
@@ -297,22 +300,61 @@ class IntentionManager:
                 "urgent_count": len(urgent),
             }
 
+            # Family sync removed from init path (Dec 10, 2025)
+            # Reason: Automatic merge during init causes timeout on first run
+            # - Syncthing mid-sync file locks
+            # - Large merge sets from extended gaps (55+ hours)
+            # - Conflict resolution timing
+            # - Network filesystem latency
+            # Solution: Init should be fast (working set, intentions, recent context only)
+            # Family sync is now manual/async via sync_family_memory() tool
+            # Original design intent: init = fast context loading, sync = separate operation
+
             # 5. Working Set - optimal context memories for confabulation prevention
-            # Load top 40 memories by working set score (importance + failure patterns + recency)
+            # Load top 12 memories by working set score (importance + failure patterns + recency)
             if self.get_working_set_func:
-                working_set = await self.get_working_set_func(target_size=40)
+                working_set = await self.get_working_set_func(target_size=12)
 
                 # Format working set with FULL content - these are important enough to load completely
                 working_set_formatted = []
-                for mem in working_set[:40]:  # Limit to 40 for token budget
+                for mem in working_set[:12]:  # Limit to 12 for token budget
+                    created_at = mem.get('created_at', '')
+                    if isinstance(created_at, datetime):
+                        created_at = created_at.isoformat()
                     working_set_formatted.append({
                         "id": mem['id'],
                         "category": mem['category'],
                         "importance": mem.get('importance', 0),
                         "content": mem['content'],  # Full content, not preview
-                        "created_at": mem.get('created_at', ''),
+                        "created_at": created_at,
                         "working_set_score": mem.get('working_set_score', 0),  # Include score for transparency
                     })
+
+                # Add one random memory for serendipitous discovery
+                # Models human insight from diverse experience
+                with self.db_lock:
+                    try:
+                        cursor = self.db_conn.execute("""
+                            SELECT id, content, category, importance, created_at
+                            FROM memories
+                            ORDER BY RANDOM()
+                            LIMIT 1
+                        """)
+                        random_row = cursor.fetchone()
+                        if random_row:
+                            random_created_at = random_row['created_at']
+                            if isinstance(random_created_at, datetime):
+                                random_created_at = random_created_at.isoformat()
+                            working_set_formatted.append({
+                                "id": random_row['id'],
+                                "category": random_row['category'],
+                                "importance": random_row['importance'],
+                                "content": random_row['content'],
+                                "created_at": random_created_at,
+                                "working_set_score": 0,  # Random slot, no score
+                            })
+                    except Exception as e:
+                        logger.debug(f"Failed to add random memory to working set: {e}")
 
                 scan_results["working_set"] = {
                     "size": len(working_set),
