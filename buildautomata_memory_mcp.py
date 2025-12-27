@@ -2908,7 +2908,7 @@ async def main():
 
     try:
         username = os.getenv("BA_USERNAME", "buildautomata_ai_v012")
-        agent_name = os.getenv("BA_AGENT_NAME", "Scout")
+        agent_name = os.getenv("BA_AGENT_NAME", "claude_assistant")
 
         logger.info(f"Initializing MemoryStore for {username}/{agent_name}")
         memory_store = MemoryStore(username, agent_name, lazy_load=True)
